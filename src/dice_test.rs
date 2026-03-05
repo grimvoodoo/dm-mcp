@@ -1,6 +1,6 @@
 //! Tests for dice rolling functionality
 
-use crate::dice::{roll_die, roll_multiple_dice, parse_dice_type, roll_dice, RollRequest};
+use crate::dice::{roll_die, roll_multiple_dice, parse_dice_type, roll_dice, RollRequest, roll_multiple_dice_request};
 
 #[test]
 fn test_roll_die() {
@@ -70,35 +70,64 @@ fn test_roll_multiple_dice() {
 
 #[test]
 fn test_parse_dice_type() {
-    assert_eq!(parse_dice_type("d4").unwrap(), "d4");
-    assert_eq!(parse_dice_type("d6").unwrap(), "d6");
-    assert_eq!(parse_dice_type("d8").unwrap(), "d8");
-    assert_eq!(parse_dice_type("d10").unwrap(), "d10");
-    assert_eq!(parse_dice_type("d12").unwrap(), "d12");
-    assert_eq!(parse_dice_type("d20").unwrap(), "d20");
-    assert_eq!(parse_dice_type("d100").unwrap(), "d100");
+    assert_eq!(parse_dice_type("d4").unwrap(), 4);
+    assert_eq!(parse_dice_type("d6").unwrap(), 6);
+    assert_eq!(parse_dice_type("d8").unwrap(), 8);
+    assert_eq!(parse_dice_type("d10").unwrap(), 10);
+    assert_eq!(parse_dice_type("d12").unwrap(), 12);
+    assert_eq!(parse_dice_type("d20").unwrap(), 20);
+    assert_eq!(parse_dice_type("d100").unwrap(), 100);
     
-    assert_eq!(parse_dice_type("11-52").unwrap(), "11-52");
+    assert_eq!(parse_dice_type("11-52").unwrap(), 20); // This is the default for non-dice strings
     
     assert!(parse_dice_type("invalid").is_err());
     assert!(parse_dice_type("d3").is_err());
 }
 
 #[test]
-fn test_roll_dice() {
-    let request = RollRequest {
-        die_type: Some("d6".to_string()),
-        count: 2,
-        min_value: None,
-        max_value: None,
-    };
-    
-    let result = roll_dice(request);
-    assert_eq!(result.results.len(), 2);
-    for &value in &result.results {
+fn test_roll_multiple_dice_request() {
+    let result = roll_multiple_dice_request("d6", 3);
+    assert_eq!(result.results.as_ref().unwrap().len(), 3);
+    for &value in result.results.as_ref().unwrap() {
         assert!(value >= 1 && value <= 6);
     }
-    assert!(result.total >= 2 && result.total <= 12);
+    assert!(result.result >= 3 && result.result <= 18); // 3 dice, each between 1-6
+    assert_eq!(result.dice, "3d6");
+}
+
+#[test]
+fn test_roll_dice_multiple() {
+    // Test the roll_dice function with multiple dice format like "3d6"
+    let result = roll_dice("3d6");
+    assert!(result.results.is_some());
+    assert_eq!(result.results.as_ref().unwrap().len(), 3);
+    for &value in result.results.as_ref().unwrap() {
+        assert!(value >= 1 && value <= 6);
+    }
+    assert!(result.result >= 3 && result.result <= 18); // 3 dice, each between 1-6
+    assert_eq!(result.dice, "3d6");
+}
+
+#[test]
+fn test_roll_dice_multiple_different_counts() {
+    // Test with different dice counts
+    let result = roll_dice("5d20");
+    assert!(result.results.is_some());
+    assert_eq!(result.results.as_ref().unwrap().len(), 5);
+    for &value in result.results.as_ref().unwrap() {
+        assert!(value >= 1 && value <= 20);
+    }
+    assert!(result.result >= 5 && result.result <= 100); // 5 dice, each between 1-20
+    assert_eq!(result.dice, "5d20");
+}
+
+#[test]
+fn test_roll_dice_single() {
+    // Test that single die rolling still works (backward compatibility)
+    let result = roll_dice("d6");
+    assert!(result.results.is_none());
+    assert!(result.result >= 1 && result.result <= 6);
+    assert_eq!(result.dice, "d6");
 }
 
 #[test]

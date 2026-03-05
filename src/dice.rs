@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RollRequest {
     pub dice: String,
+    pub count: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RollResult {
     pub result: i32,
     pub dice: String,
+    pub results: Option<Vec<i32>>,
 }
 
 pub fn roll_die(sides: u32) -> i32 {
@@ -46,6 +48,7 @@ pub fn roll_dice(input: &str) -> RollResult {
                 return RollResult {
                     result,
                     dice: input.to_string(),
+                    results: None,
                 };
             }
         }
@@ -58,6 +61,18 @@ pub fn roll_dice(input: &str) -> RollResult {
     RollResult {
         result,
         dice: input.to_string(),
+        results: None,
+    }
+}
+
+pub fn roll_multiple_dice_request(dice_type: &str, count: usize) -> RollResult {
+    let results = roll_multiple_dice(dice_type, count);
+    let total: i32 = results.iter().sum();
+    
+    RollResult {
+        result: total,
+        dice: format!("{}d{}", count, parse_dice_type(dice_type)),
+        results: Some(results),
     }
 }
 
@@ -92,5 +107,15 @@ mod tests {
         let result = roll_dice("11-52");
         assert!(result.result >= 11 && result.result <= 52);
         assert_eq!(result.dice, "11-52");
+    }
+    
+    #[test]
+    fn test_roll_multiple_dice_request() {
+        let result = roll_multiple_dice_request("d6", 3);
+        assert_eq!(result.results.as_ref().unwrap().len(), 3);
+        for &value in result.results.as_ref().unwrap() {
+            assert!(value >= 1 && value <= 6);
+        }
+        assert!(result.result >= 3 && result.result <= 18); // 3 dice, each between 1-6
     }
 }
