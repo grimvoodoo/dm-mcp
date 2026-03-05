@@ -4,35 +4,68 @@ use crate::dice::{roll_die, roll_multiple_dice, parse_dice_type, roll_dice, Roll
 
 #[test]
 fn test_roll_die() {
-    let result = roll_die("d4");
-    assert!(result >= 1 && result <= 4);
+    // Test each die type 10 times and ensure at least two different numbers are returned
+    let die_types = vec!["d4", "d6", "d8", "d10", "d12", "d20", "d100"];
     
-    let result = roll_die("d6");
-    assert!(result >= 1 && result <= 6);
-    
-    let result = roll_die("d8");
-    assert!(result >= 1 && result <= 8);
-    
-    let result = roll_die("d10");
-    assert!(result >= 1 && result <= 10);
-    
-    let result = roll_die("d12");
-    assert!(result >= 1 && result <= 12);
-    
-    let result = roll_die("d20");
-    assert!(result >= 1 && result <= 20);
-    
-    let result = roll_die("d100");
-    assert!(result >= 1 && result <= 100);
+    for die_type in die_types {
+        let mut results = Vec::new();
+        for _ in 0..10 {
+            let result = roll_die(die_type);
+            results.push(result);
+            
+            // Ensure each result is within the expected range
+            match die_type {
+                "d4" => assert!(result >= 1 && result <= 4),
+                "d6" => assert!(result >= 1 && result <= 6),
+                "d8" => assert!(result >= 1 && result <= 8),
+                "d10" => assert!(result >= 1 && result <= 10),
+                "d12" => assert!(result >= 1 && result <= 12),
+                "d20" => assert!(result >= 1 && result <= 20),
+                "d100" => assert!(result >= 1 && result <= 100),
+                _ => panic!("Unexpected die type"),
+            }
+        }
+        
+        // Ensure at least two different numbers were returned
+        // Simplified approach: check if we have at least 2 unique values
+        let mut seen_values = std::collections::HashSet::new();
+        for &value in &results {
+            seen_values.insert(value);
+        }
+        assert!(seen_values.len() >= 2, "Die {} should return at least 2 different values in 10 rolls", die_type);
+    }
 }
 
 #[test]
 fn test_roll_multiple_dice() {
-    let results = roll_multiple_dice("d6", 3);
-    assert_eq!(results.len(), 3);
-    for &result in &results {
-        assert!(result >= 1 && result <= 6);
+    // Test rolling multiple dice 10 times to ensure at least two different numbers are returned
+    let die_type = "d6";
+    let count = 3;
+    
+    let mut all_results = Vec::new();
+    for _ in 0..10 {
+        let results = roll_multiple_dice(die_type, count);
+        assert_eq!(results.len(), count);
+        
+        for &result in &results {
+            assert!(result >= 1 && result <= 6);
+            all_results.push(result);
+        }
     }
+    
+    // Ensure at least two different numbers were returned across 10 rolls
+    let mut seen_values = std::collections::HashSet::new();
+    for &value in &all_results {
+        seen_values.insert(value);
+    }
+    assert!(seen_values.len() >= 2, "Multiple dice rolling should return at least 2 different values in 10 rolls");
+    
+    // Verify that the total sum is within expected bounds
+    let total: i32 = all_results.iter().sum();
+    let min_expected = count as i32 * 1;  // Minimum possible sum (each die shows 1)
+    let max_expected = count as i32 * 6;  // Maximum possible sum (each die shows 6)
+    assert!(total >= min_expected && total <= max_expected,
+            "Total sum {} should be between {} and {}", total, min_expected, max_expected);
 }
 
 #[test]
