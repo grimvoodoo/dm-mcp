@@ -4,7 +4,38 @@ An MCP (Model Context Protocol) toolkit for AI Dungeon Masters running solo RPG 
 
 ## Status
 
-**Pre-MVP.** Active redesign on branch `feature/re-design`. The main branch still carries a dice-rolling stub; design work for the full toolkit has landed in [`docs/`](docs/README.md) and implementation is underway. Features listed here describe the designed product, not the shipped one.
+**Pre-MVP.** Design complete — full rationale in [`docs/`](docs/README.md). Implementation proceeds through the phased [Roadmap](#roadmap) below. The `main` branch still carries the original dice-rolling stub; phase branches land via PR. Features described elsewhere in this README are the designed product; consult the Roadmap for what ships when.
+
+## Roadmap
+
+Implementation is broken into 10 small, testable phases. Each phase ships a vertical slice with E2E integration tests (`cargo test`, subprocess-spawned binary driven through real MCP protocol — see [docs/architecture.md](docs/architecture.md)).
+
+### Per-phase workflow
+
+1. Branch off `main` → `feature/phase-N-<name>`.
+2. Implement the phase's tools and supporting code.
+3. Write integration tests in `tests/` covering the E2E assertion(s) in the table below. Unit-test any non-trivial internal function.
+4. `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` — all clean.
+5. Tick the phase's checkbox in the table below and link the PR.
+6. Push branch → `gh pr create --base main` with a description summarising scope and assertions.
+
+Do not merge multiple phases in one PR; each phase is a discrete reviewable slice.
+
+### Phases
+
+| # | Phase | Scope | E2E assertion | Status | PR |
+|---|-------|-------|---------------|--------|----|
+| 1 | **Skeleton** | Binary builds; `dm-mcp stdio` and `dm-mcp http` subcommands; `Config` loaded from `DMMCP_` env vars; HTTP serves `/healthz`; MCP handshake over stdio; trivial `server.info` tool; old stub code, `httpstream.rs`, `dice_test.rs`, and unused deps (`rust-mcp-sdk`, `rust-mcp-transport`, `hyper`, `rustls`, `tokio-rustls`) removed; `rmcp` added. | Spawn HTTP → `GET /healthz` = 200. Spawn stdio → MCP handshake succeeds → `server.info` returns expected shape (version + transport). | ☐ | – |
+| 2 | **DB + content loader** | Schema migrations for all tables from the design; SQLite connection opened with configured PRAGMAs; bundled YAML content for `abilities`, `skills`, `damage_types`, `conditions`, plus one sample biome, weapon base, enchantment, and archetype; content parsed once at startup into typed structs; `content.introspect` tool. | Delete DB file → start server → file exists with all expected tables. `content.introspect` response contains expected content IDs. | ☐ | – |
+| 3 | **Dice** | `dice.roll` tool: standard dice (d4–d100), arbitrary ranges (`11-43`), multi-dice (`3d6`) with per-die results and sum. | `dice.roll("d20")` → result ∈ [1, 20]. `dice.roll("3d6")` → 3 rolls, sum equals total. `dice.roll("11-43")` → result ∈ [11, 43]. | ☐ | – |
+| 4 | **Character core** | `character.create`, `character.get` (effective stats with active effects composed), `character.update_plans`, `character.change_role`; `character_proficiencies` CRUD; `effects` table: `apply_effect`, `dispel_effect`; `character_resources` CRUD. | Create character with STR 14 → `apply_effect(+4 STR)` → `character.get` shows effective 18 → `dispel_effect` → shows 14. Event log has `character.created`, `effect.applied`, `effect.expired`. | ☐ | – |
+| 5 | **Checks** | `resolve_check` composing base + ability mod + proficiency + ranks + effects + conditions + caller modifiers; condition mechanical riders loaded from `content/rules/conditions.yaml`; ideology-alignment modifier threaded via `check_spec.modifiers`. | Apply Bless (`1d4` on checks) → resolve persuasion → breakdown contains rolled bless die. Apply blinded → resolve attack → two d20s rolled, lower taken. Pass `{kind: ideology_alignment, value: -6}` → event payload records the modifier with reason. | ☐ | – |
+| 6 | **Campaign setup + starting zone** | `setup.new_campaign`, `setup.answer`, `setup.generate_world` (starting zone + 2–5 stub neighbours, no NPCs yet), `setup.mark_ready`; `campaign_state` singleton transitions setup → running, `campaign_hour` = 0. | Full setup flow (new → 3 answers → generate → ready) → DB has starting zone matching biome answer, 2–5 stub neighbour zone rows, `campaign_state.phase='running'`, `campaign.started` event at hour 0. | ☐ | – |
+| 7 | **Travel + fog of war** | `world.travel`, `world.map`, `world.describe_zone`; entering a zone triggers stub-generation for missing neighbours; first-visit full generation creates landmarks (NPC placement deferred to Phase 8). | Travel to neighbour → `campaign_hour` advanced by edge's `travel_time_hours`, `character_zone_knowledge.level` = 'visited', `world.map` returns both zones with computed 2D positions and connection. | ☐ | – |
+| 8 | **NPC generation + recall** | `npc.generate` with two committed archetypes (one friendly, one enemy); backstory synthesis with 3–5 events at negative `campaign_hour`; reconciliation pass fills slots from existing characters/zones; `character.recall` with filters; zone full-generation now places NPCs. | Generate orc_raider in a zone → character row has stats in archetype range, proficiencies inserted, loadout items held. Event log has 3–5 `history.backstory` events with `campaign_hour < 0` and the orc as a participant. `character.recall(orc.id)` returns those events. | ☐ | – |
+| 9 | **Encounters + combat + death** | `encounter.create`, `encounter.complete` (XP flow by resolution path), `encounter.abandon`, `encounter.fail`; `combat.start` with stale-combat auto-cleanup, `combat.next_turn` with round-based effect/condition expiry, `combat.end`; `combat.apply_damage` integrates the death flow (`mortally_wounded` at 0 HP → `roll_death_save` → `roll_death_event` on 3 failures); short/long rest tools. | Start encounter → combat → `next_turn` × N with 2-round effect → expired after round 3. Damage to 0 HP → `mortally_wounded` applied, status='unconscious'. Three failed death saves → status='dead' → `roll_death_event` returns a rolled event. Starting a second combat while first still flagged → first auto-ended, `combat.auto_ended` emitted. | ☐ | – |
+| 10 | **Inventory + barter + encumbrance** | Full items tool surface: `inventory.create/transfer/pickup/drop/equip/unequip/get/inspect`; weight computation; encumbrance enforcement (`encumbered` condition between 67% and 100%, pickup refused above 100%); `barter.exchange` with persuasion-check-driven rate. | STR 10 (capacity 150 lb) → pickup 100 lb → no condition. Pickup 10 more → 73% of capacity → `encumbered` applied. Pickup 50 more (would be 160) → refused with `would_overload`. Barter: offer below fair value → persuasion check → success completes, failure → merchant declines. | ☐ | – |
+
 
 ## What it does
 
