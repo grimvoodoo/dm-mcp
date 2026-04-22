@@ -107,7 +107,10 @@ async fn main() -> Result<()> {
         .call_tool(CallToolRequestParams::new("server.info"))
         .await
         .context("call_tool server.info")?;
-    println!("  is_error : {:?}", result.is_error);
+    // Per the MCP spec `is_error` is optional — `None` and `Some(false)` both mean
+    // "success", only `Some(true)` is an actual error. Collapse to a bool for display.
+    let is_error = result.is_error.unwrap_or(false);
+    println!("  is_error : {is_error}");
     if result.content.is_empty() {
         println!("  content  : <empty>");
     }
