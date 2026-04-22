@@ -16,7 +16,7 @@
 
 use anyhow::{bail, Context, Result};
 use rand::RngExt;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::content::{Content, SetupQuestion};
@@ -95,25 +95,26 @@ pub fn answer(conn: &mut Connection, content: &Content, p: AnswerParams) -> Resu
     if phase != "setup" {
         bail!("cannot record an answer once the campaign has left 'setup' (currently {phase:?})");
     }
-    if !content
+    let question = content
         .setup_questions
         .iter()
-        .any(|q| q.id == p.question_id)
-    {
-        bail!(
-            "unknown question_id {:?}; valid: {:?}",
-            p.question_id,
-            content
-                .setup_questions
-                .iter()
-                .map(|q| q.id.as_str())
-                .collect::<Vec<_>>()
-        );
-    }
+        .find(|q| q.id == p.question_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown question_id {:?}; valid: {:?}",
+                p.question_id,
+                content
+                    .setup_questions
+                    .iter()
+                    .map(|q| q.id.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })?;
+
+    validate_answer_against_question(question, &p.answer)?;
 
     let answer_json = serde_json::to_string(&p.answer).context("encode answer")?;
-    // Wall-clock for the audit trail; campaign_hour is still 0.
-    let now = wall_clock_seconds();
+    let now = wall_clock_millis();
 
     conn.execute(
         "INSERT INTO campaign_setup_answers (question_id, answer, answered_at)
@@ -130,6 +131,58 @@ pub fn answer(conn: &mut Connection, content: &Content, p: AnswerParams) -> Resu
     })
 }
 
+/// Validate an answer JSON value against a question's `multi`/`options`/`or_free_text`
+/// declaration:
+/// - multi=true: answer must be an array of strings; each must be in `options` (unless
+///   `or_free_text` allows free text)
+/// - multi=false: answer must be a string; in `options` (unless `or_free_text`)
+fn validate_answer_against_question(q: &SetupQuestion, answer: &serde_json::Value) -> Result<()> {
+    if q.multi {
+        let arr = answer.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "question {:?} is multi-select; answer must be a JSON array of strings, got {:?}",
+                q.id,
+                answer
+            )
+        })?;
+        for v in arr {
+            let s = v.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "question {:?} multi-select array elements must be strings; got {:?}",
+                    q.id,
+                    v
+                )
+            })?;
+            ensure_option_or_free_text(q, s)?;
+        }
+    } else {
+        let s = answer.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "question {:?} is single-choice; answer must be a JSON string, got {:?}",
+                q.id,
+                answer
+            )
+        })?;
+        ensure_option_or_free_text(q, s)?;
+    }
+    Ok(())
+}
+
+fn ensure_option_or_free_text(q: &SetupQuestion, s: &str) -> Result<()> {
+    if q.options.iter().any(|opt| opt == s) {
+        return Ok(());
+    }
+    if q.or_free_text {
+        return Ok(());
+    }
+    bail!(
+        "answer {:?} is not in question {:?}'s allowed options (and free text is disabled); valid: {:?}",
+        s,
+        q.id,
+        q.options
+    );
+}
+
 // ── generate_world ────────────────────────────────────────────────────────────
 
 pub fn generate_world(conn: &mut Connection, _content: &Content) -> Result<GenerateWorldResult> {
@@ -142,14 +195,38 @@ pub fn generate_world(conn: &mut Connection, _content: &Content) -> Result<Gener
     let starting_biome = read_string_answer(conn, "starting_biome")?
         .ok_or_else(|| anyhow::anyhow!("starting_biome answer not recorded"))?;
 
-    // Match the biome against content if possible — Phase 6 only ships one biome
-    // (temperate_forest) but a free-text answer is also accepted by the Roadmap. If the
-    // biome is unknown we still create the zone using the literal biome string.
+    // Refuse re-runs: a world.generated event already in the log means a starting zone is
+    // in place. Re-running would silently double the world's geography.
+    if world_already_generated(conn)? {
+        bail!(
+            "generate_world has already run for this campaign (a world.generated event \
+             exists). Re-running would create a second starting zone and a duplicate set \
+             of neighbours."
+        );
+    }
+
     let starting_zone_name = format!("Starting {biome}", biome = starting_biome.replace('_', " "));
 
-    // Insert the starting zone.
-    let starting_zone_id = insert_zone(
-        conn,
+    // Pick how many stub neighbours: 2–5, biased toward the lower end. Use the dice RNG
+    // so this respects any test seed if we add seeding later. RNG decisions made up-front
+    // (outside the transaction) so a transaction retry replays deterministically.
+    let mut rng = rand::rng();
+    let neighbour_count: u8 = rng.random_range(2..=5);
+    const DIRECTIONS: &[&str] = &["n", "ne", "e", "se", "s", "sw", "w", "nw"];
+    let mut chosen: Vec<&'static str> = DIRECTIONS.to_vec();
+    for i in (1..chosen.len()).rev() {
+        let j = rng.random_range(0..=i);
+        chosen.swap(i, j);
+    }
+    let chosen_dirs: Vec<&'static str> =
+        chosen.into_iter().take(neighbour_count as usize).collect();
+
+    // Single transaction wraps zone inserts + connections + the world.generated event.
+    // Either every row is committed together, or none — no half-built world.
+    let tx = conn.transaction().context("begin generate_world tx")?;
+
+    let starting_zone_id = insert_zone_tx(
+        &tx,
         &starting_zone_name,
         &starting_biome,
         "wilderness",
@@ -158,27 +235,11 @@ pub fn generate_world(conn: &mut Connection, _content: &Content) -> Result<Gener
     )
     .context("insert starting zone")?;
 
-    // Pick how many stub neighbours: 2–5, biased toward the lower end. Use the dice RNG
-    // so this respects any test seed if we add seeding later.
-    let mut rng = rand::rng();
-    let neighbour_count: u8 = rng.random_range(2..=5);
-
-    // Compass directions for Phase 6 — we lay neighbours around the starting zone in
-    // distinct directions so the eventual map renderer doesn't pile them on top of each
-    // other.
-    const DIRECTIONS: &[&str] = &["n", "ne", "e", "se", "s", "sw", "w", "nw"];
-    let mut chosen: Vec<&'static str> = DIRECTIONS.to_vec();
-    // Trivial Fisher–Yates so the chosen directions vary across runs.
-    for i in (1..chosen.len()).rev() {
-        let j = rng.random_range(0..=i);
-        chosen.swap(i, j);
-    }
-
-    let mut neighbour_ids = Vec::with_capacity(neighbour_count as usize);
-    for (i, dir) in chosen.iter().take(neighbour_count as usize).enumerate() {
+    let mut neighbour_ids = Vec::with_capacity(chosen_dirs.len());
+    for (i, dir) in chosen_dirs.iter().enumerate() {
         let neighbour_name = format!("Unexplored {label}", label = direction_label(dir));
-        let neighbour_id = insert_zone(
-            conn,
+        let neighbour_id = insert_zone_tx(
+            &tx,
             &neighbour_name,
             // Neighbours inherit the starting biome as a stub default — Phase 7's
             // full-generation pass will refine.
@@ -188,18 +249,16 @@ pub fn generate_world(conn: &mut Connection, _content: &Content) -> Result<Gener
             None,
         )
         .with_context(|| format!("insert neighbour {i}"))?;
-        // Forward edge.
-        insert_connection(
-            conn,
+        insert_connection_tx(
+            &tx,
             starting_zone_id,
             neighbour_id,
             travel_time_for(dir),
             "wilderness",
             dir,
         )?;
-        // Reverse edge — direction flipped.
-        insert_connection(
-            conn,
+        insert_connection_tx(
+            &tx,
             neighbour_id,
             starting_zone_id,
             travel_time_for(dir),
@@ -209,9 +268,8 @@ pub fn generate_world(conn: &mut Connection, _content: &Content) -> Result<Gener
         neighbour_ids.push(neighbour_id);
     }
 
-    // Emit a single "world.generated" event capturing the zones created.
-    let emitted = events::emit(
-        conn,
+    let emitted = events::emit_in_tx(
+        &tx,
         &EventSpec {
             kind: "world.generated",
             campaign_hour: 0,
@@ -234,6 +292,8 @@ pub fn generate_world(conn: &mut Connection, _content: &Content) -> Result<Gener
         },
     )?;
 
+    tx.commit().context("commit generate_world tx")?;
+
     Ok(GenerateWorldResult {
         starting_zone_id,
         starting_zone_name,
@@ -243,6 +303,17 @@ pub fn generate_world(conn: &mut Connection, _content: &Content) -> Result<Gener
     })
 }
 
+fn world_already_generated(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'world.generated'",
+            [],
+            |row| row.get(0),
+        )
+        .context("check for prior world.generated event")?;
+    Ok(count > 0)
+}
+
 // ── mark_ready ────────────────────────────────────────────────────────────────
 
 pub fn mark_ready(conn: &mut Connection, p: MarkReadyParams) -> Result<MarkReadyResult> {
@@ -250,9 +321,28 @@ pub fn mark_ready(conn: &mut Connection, p: MarkReadyParams) -> Result<MarkReady
     if phase != "setup" {
         bail!("mark_ready called twice — campaign is already in phase {phase:?}");
     }
-    let started_at = wall_clock_seconds();
+    if !world_already_generated(conn)? {
+        bail!(
+            "mark_ready requires generate_world to have run first — without it the running \
+             campaign would have no starting zone, and a later generate_world call would be \
+             refused (it only runs in setup phase)."
+        );
+    }
+    let started_at = wall_clock_millis();
 
-    conn.execute(
+    let participants: Vec<crate::events::Participant<'_>> = match p.player_character_id {
+        Some(pcid) => vec![crate::events::Participant {
+            character_id: pcid,
+            role: "actor",
+        }],
+        None => vec![],
+    };
+
+    // Single transaction wraps the campaign_state flip + the campaign.started event so
+    // an interrupted call cannot leave the singleton mid-transition or the event missing.
+    let tx = conn.transaction().context("begin mark_ready tx")?;
+
+    tx.execute(
         "UPDATE campaign_state
          SET phase = 'running', started_at = ?1, player_character_id = ?2
          WHERE id = 1",
@@ -260,15 +350,8 @@ pub fn mark_ready(conn: &mut Connection, p: MarkReadyParams) -> Result<MarkReady
     )
     .context("flip campaign_state to running")?;
 
-    let mut participants = Vec::new();
-    if let Some(pcid) = p.player_character_id {
-        participants.push(crate::events::Participant {
-            character_id: pcid,
-            role: "actor",
-        });
-    }
-    let emitted = events::emit(
-        conn,
+    let emitted = events::emit_in_tx(
+        &tx,
         &EventSpec {
             kind: "campaign.started",
             campaign_hour: 0,
@@ -276,7 +359,7 @@ pub fn mark_ready(conn: &mut Connection, p: MarkReadyParams) -> Result<MarkReady
             zone_id: None,
             encounter_id: None,
             parent_id: None,
-            summary: format!("Campaign started at {started_at} (epoch seconds)"),
+            summary: format!("Campaign started at {started_at} (epoch ms)"),
             payload: serde_json::json!({
                 "started_at": started_at,
                 "player_character_id": p.player_character_id,
@@ -285,6 +368,8 @@ pub fn mark_ready(conn: &mut Connection, p: MarkReadyParams) -> Result<MarkReady
             items: &[],
         },
     )?;
+
+    tx.commit().context("commit mark_ready tx")?;
 
     Ok(MarkReadyResult {
         phase: "running".to_string(),
@@ -320,32 +405,33 @@ fn read_string_answer(conn: &Connection, question_id: &str) -> Result<Option<Str
     Ok(value.as_str().map(|s| s.to_string()))
 }
 
-fn insert_zone(
-    conn: &Connection,
+/// Transaction-aware variant — used by generate_world inside its single tx.
+fn insert_zone_tx(
+    tx: &Transaction<'_>,
     name: &str,
     biome: &str,
     kind: &str,
     size: &str,
     parent_zone_id: Option<i64>,
 ) -> Result<i64> {
-    conn.execute(
+    tx.execute(
         "INSERT INTO zones (name, biome, kind, size, parent_zone_id, encounter_tags)
          VALUES (?1, ?2, ?3, ?4, ?5, '[]')",
         params![name, biome, kind, size, parent_zone_id],
     )
     .context("insert zones row")?;
-    Ok(conn.last_insert_rowid())
+    Ok(tx.last_insert_rowid())
 }
 
-fn insert_connection(
-    conn: &Connection,
+fn insert_connection_tx(
+    tx: &Transaction<'_>,
     from: i64,
     to: i64,
     hours: i32,
     mode: &str,
     direction: &str,
 ) -> Result<()> {
-    conn.execute(
+    tx.execute(
         "INSERT INTO zone_connections
             (from_zone_id, to_zone_id, travel_time_hours, travel_mode, one_way, direction_from)
          VALUES (?1, ?2, ?3, ?4, 0, ?5)",
@@ -393,11 +479,11 @@ fn direction_label(d: &str) -> &'static str {
     }
 }
 
-fn wall_clock_seconds() -> i64 {
+fn wall_clock_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
@@ -587,5 +673,102 @@ mod tests {
         )
         .expect_err("second mark_ready should fail");
         assert!(format!("{err:#}").contains("already in phase"));
+    }
+
+    #[test]
+    fn mark_ready_requires_generate_world_first() {
+        let (mut conn, _content) = fresh();
+        // Phase is 'setup', no world.generated event yet.
+        let err = mark_ready(
+            &mut conn,
+            MarkReadyParams {
+                player_character_id: None,
+            },
+        )
+        .expect_err("mark_ready without generate_world should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("generate_world"),
+            "error should explain the precondition: {msg}"
+        );
+    }
+
+    #[test]
+    fn generate_world_refuses_double_invocation() {
+        let (mut conn, content) = fresh();
+        answer(
+            &mut conn,
+            &content,
+            AnswerParams {
+                question_id: "starting_biome".into(),
+                answer: serde_json::json!("temperate_forest"),
+            },
+        )
+        .unwrap();
+        generate_world(&mut conn, &content).unwrap();
+        let err =
+            generate_world(&mut conn, &content).expect_err("second generate_world should fail");
+        assert!(format!("{err:#}").contains("already run"));
+    }
+
+    #[test]
+    fn answer_rejects_value_outside_question_options() {
+        let (mut conn, content) = fresh();
+        // tone is single-choice grim/balanced/heroic and disables free text.
+        let err = answer(
+            &mut conn,
+            &content,
+            AnswerParams {
+                question_id: "tone".into(),
+                answer: serde_json::json!("ridiculous"),
+            },
+        )
+        .expect_err("invalid tone should be rejected");
+        assert!(format!("{err:#}").contains("not in question"));
+    }
+
+    #[test]
+    fn answer_rejects_array_for_single_choice_question() {
+        let (mut conn, content) = fresh();
+        let err = answer(
+            &mut conn,
+            &content,
+            AnswerParams {
+                question_id: "tone".into(),
+                answer: serde_json::json!(["grim", "heroic"]),
+            },
+        )
+        .expect_err("array answer to single-choice should fail");
+        assert!(format!("{err:#}").contains("single-choice"));
+    }
+
+    #[test]
+    fn answer_rejects_string_for_multi_choice_question() {
+        let (mut conn, content) = fresh();
+        let err = answer(
+            &mut conn,
+            &content,
+            AnswerParams {
+                question_id: "enemy_preference".into(),
+                answer: serde_json::json!("undead"),
+            },
+        )
+        .expect_err("string answer to multi-select should fail");
+        assert!(format!("{err:#}").contains("multi-select"));
+    }
+
+    #[test]
+    fn answer_accepts_free_text_when_allowed() {
+        let (mut conn, content) = fresh();
+        // starting_biome has or_free_text=true, so a non-listed value is OK.
+        answer(
+            &mut conn,
+            &content,
+            AnswerParams {
+                question_id: "starting_biome".into(),
+                answer: serde_json::json!("ash_wastes_of_the_old_war"),
+            },
+        )
+        .expect("free-text biome should be accepted");
     }
 }
