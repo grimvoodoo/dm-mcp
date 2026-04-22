@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::characters::{
     self, ChangeRoleParams, CreateParams as CharCreateParams, GetParams, UpdatePlansParams,
 };
+use crate::checks::{self, ResolveCheckParams};
+use crate::conditions::{self, ApplyConditionParams, RemoveConditionParams};
 use crate::content::Content as ContentCatalog;
 use crate::db::DbHandle;
 use crate::dice;
@@ -307,6 +309,56 @@ impl DmMcpHandler {
         with_db_mut(&self.db, |conn| {
             proficiencies::remove_resource(conn, params)
         })
+    }
+
+    // ── Conditions ────────────────────────────────────────────────────────────
+
+    #[tool(
+        name = "condition.apply",
+        description = "Apply a named condition (blinded, poisoned, mortally_wounded, ...) to a character. Conditions are separate from effects: they carry rule-level riders (disadvantage, auto-fail, speed penalties) defined in content/rules/conditions.yaml."
+    )]
+    async fn condition_apply(
+        &self,
+        Parameters(params): Parameters<ApplyConditionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| conditions::apply(conn, params))
+    }
+
+    #[tool(
+        name = "condition.remove",
+        description = "Deactivate an active condition. Emits condition.expired with a reason (save succeeded, spell dispelled, time expired)."
+    )]
+    async fn condition_remove(
+        &self,
+        Parameters(params): Parameters<RemoveConditionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| conditions::remove(conn, params))
+    }
+
+    // ── Check resolution ──────────────────────────────────────────────────────
+
+    #[tool(
+        name = "resolve_check",
+        description = "Resolve a skill / save / attack / ability check. Composes base + effective ability + proficiency + ranks + active effects (flat modifiers and per-check dice like Bless) + condition riders (advantage/disadvantage/auto_fail) + caller-supplied named modifiers. Rolls d20 (or 2d20 for adv/dis) and returns the full breakdown plus success against any DC."
+    )]
+    async fn resolve_check(
+        &self,
+        Parameters(params): Parameters<ResolveCheckParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // resolve_check needs both the DB and content; the with_db_mut helper only
+        // threads the DB, so do the mutex + content wiring inline.
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            checks::resolve(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 
