@@ -55,9 +55,17 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .try_init();
 
-    // Examples don't get `CARGO_BIN_EXE_<name>`, so locate the debug binary ourselves.
-    // `make demo` depends on `_build-debug`, which guarantees this path exists.
-    let bin_path = std::env::current_dir()?.join("target/debug/dm-mcp");
+    // Examples don't get `CARGO_BIN_EXE_<name>`, so locate the dm-mcp binary relative to
+    // where *this* example was built. current_exe() is target/<profile>/examples/manual_demo,
+    // so walking up twice lands in target/<profile>/ — which holds the sibling dm-mcp binary
+    // for the same profile. This honors CARGO_TARGET_DIR and works for both debug and release.
+    // `make demo` depends on `_build-debug`, which guarantees dm-mcp exists in that directory.
+    let current_exe = std::env::current_exe().context("locate manual_demo executable")?;
+    let profile_dir = current_exe
+        .parent()
+        .and_then(|examples_dir| examples_dir.parent())
+        .context("manual_demo should run from target/<profile>/examples")?;
+    let bin_path = profile_dir.join(format!("dm-mcp{}", std::env::consts::EXE_SUFFIX));
     if !bin_path.exists() {
         anyhow::bail!(
             "dm-mcp binary not found at {}.\n  \
