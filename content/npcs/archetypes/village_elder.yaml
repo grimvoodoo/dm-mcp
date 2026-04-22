@@ -1,0 +1,47 @@
+# One sample archetype for Phase 2. Note: no alignment axis — archetype
+# describes role + current faction, not species essence. See docs/npcs.md
+# §Non-violent resolution.
+
+id: village_elder
+species: human
+role_hint: friendly
+typical_age_years: [55, 80]
+
+stats:
+  str: [8, 11]
+  dex: [8, 11]
+  con: [10, 13]
+  int: [12, 16]
+  wis: [14, 18]
+  cha: [12, 16]
+
+hp_formula: "2d6 + con_mod*2"
+ac_base: 10
+speed_ft: 25
+
+proficiencies:
+  - { name: 'save:wis',    proficient: true }
+  - { name: insight,       proficient: true }
+  - { name: history,       proficient: true }
+  - { name: persuasion,    proficient: true }
+
+loadout:
+  - { base_kind: longsword, chance: 0.15, material: steel, material_tier: 1, notes: "Symbolic; rarely drawn" }
+
+plan_pool:
+  - "Preserve the village through another winter"
+  - "Find someone to pass stewardship to"
+  - "Reconcile an old feud before it's too late"
+
+ideology_pool:
+  - "The village is only the people in it; everything else can be rebuilt"
+  - "Tradition is load-bearing; change costs more than it saves"
+
+social:
+  can_parley: true
+  parley_requires: []
+
+backstory_hooks:
+  - "Served ${predecessor} as reeve before the old one passed"
+  - "Brokered peace with ${neighbouring_settlement} after ${past_conflict}"
+  - "Lost ${relation} to ${past_disaster}"

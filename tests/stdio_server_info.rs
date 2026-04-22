@@ -7,16 +7,22 @@ use anyhow::{Context, Result};
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
+use tempfile::TempDir;
 use tokio::process::Command;
 
 fn bin_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_dm-mcp"))
 }
 
-async fn connect() -> Result<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> {
+/// Spawn the binary with an isolated tmp campaign DB. Tests run in parallel by default,
+/// so sharing `./campaign.db` between spawns would race on schema migration.
+async fn connect(
+    _tmp: &TempDir,
+) -> Result<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> {
     let mut cmd = Command::new(bin_path());
     cmd.arg("stdio");
     cmd.env("DMMCP_LOG_LEVEL", "warn");
+    cmd.env("DMMCP_DB_PATH", _tmp.path().join("campaign.db"));
     let transport = TokioChildProcess::new(cmd).context("spawn child")?;
     let client = ().serve(transport).await.context("mcp handshake")?;
     Ok(client)
@@ -24,7 +30,8 @@ async fn connect() -> Result<rmcp::service::RunningService<rmcp::service::RoleCl
 
 #[tokio::test]
 async fn handshake_and_peer_info_reports_server_name() -> Result<()> {
-    let client = connect().await?;
+    let tmp = TempDir::new()?;
+    let client = connect(&tmp).await?;
 
     let info = client
         .peer_info()
@@ -45,7 +52,8 @@ async fn handshake_and_peer_info_reports_server_name() -> Result<()> {
 
 #[tokio::test]
 async fn server_info_tool_is_listed() -> Result<()> {
-    let client = connect().await?;
+    let tmp = TempDir::new()?;
+    let client = connect(&tmp).await?;
 
     let tools = client.list_all_tools().await?;
     assert!(
@@ -60,7 +68,8 @@ async fn server_info_tool_is_listed() -> Result<()> {
 
 #[tokio::test]
 async fn server_info_tool_returns_expected_shape() -> Result<()> {
-    let client = connect().await?;
+    let tmp = TempDir::new()?;
+    let client = connect(&tmp).await?;
 
     let result = client
         .call_tool(CallToolRequestParams::new("server.info"))

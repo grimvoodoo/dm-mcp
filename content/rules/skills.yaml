@@ -1,0 +1,23 @@
+# Named skills and the ability each defaults to. Mechanically 5.1 SRD-aligned;
+# skill names are generic / descriptive, not WotC-owned branding. Descriptions
+# are original. See docs/ip-and-licensing.md.
+
+skills:
+  - { id: acrobatics,      ability: dex, description: "Keep your feet on narrow ledges; tumble or dive" }
+  - { id: animal_handling, ability: wis, description: "Calm, direct, or soothe beasts of limited intellect" }
+  - { id: arcana,          ability: int, description: "Recall arcane lore — spells, planes, artefacts" }
+  - { id: athletics,       ability: str, description: "Climb, swim, jump, grapple" }
+  - { id: deception,       ability: cha, description: "Convince someone a lie is the truth" }
+  - { id: history,         ability: int, description: "Recall the events of the past" }
+  - { id: insight,         ability: wis, description: "Read body language, guess intent" }
+  - { id: intimidation,    ability: cha, description: "Impose your will through threat or presence" }
+  - { id: investigation,   ability: int, description: "Work out how something fits together" }
+  - { id: medicine,        ability: wis, description: "Stabilise the dying, diagnose an ailment" }
+  - { id: nature,          ability: int, description: "Know plants, animals, terrain, weather" }
+  - { id: perception,      ability: wis, description: "Spot, hear, otherwise notice your surroundings" }
+  - { id: performance,     ability: cha, description: "Entertain a crowd — music, theatre, rhetoric" }
+  - { id: persuasion,      ability: cha, description: "Win hearts and minds through reasoned argument" }
+  - { id: religion,        ability: int, description: "Recall deities, holy orders, funerary rites" }
+  - { id: sleight_of_hand, ability: dex, description: "Pick a pocket; palm a coin; plant a thing" }
+  - { id: stealth,         ability: dex, description: "Move unseen, unheard" }
+  - { id: survival,        ability: wis, description: "Track, hunt, navigate wild places" }

@@ -20,6 +20,7 @@ use rmcp::transport::streamable_http_server::tower::{
 use tokio_util::sync::CancellationToken;
 
 use crate::config::HttpConfig;
+use crate::content::Content;
 use crate::handler::{DmMcpHandler, Transport};
 
 #[derive(Clone)]
@@ -27,17 +28,21 @@ struct HealthState;
 
 /// Run the HTTP transport, serving MCP under `/mcp` and health under `/healthz`.
 ///
-/// Completes when a shutdown signal is received (SIGINT) and all in-flight requests drain.
-pub async fn run(cfg: &HttpConfig) -> Result<()> {
+/// Completes when a shutdown signal is received (SIGINT / SIGTERM) and all in-flight
+/// requests drain.
+pub async fn run(cfg: &HttpConfig, content: Arc<Content>) -> Result<()> {
     let addr = cfg.socket_addr();
     tracing::info!(bind = %addr, "dm-mcp: serving MCP over HTTP");
 
     let cancel = CancellationToken::new();
 
-    // Factory: each new MCP session gets its own handler instance. The handler is cheap to
-    // construct; future phases may share more state via Arc inside DmMcpHandler.
+    // Factory: each new MCP session gets its own handler instance, sharing the same
+    // content catalog via Arc clone.
     let mcp_service = StreamableHttpService::new(
-        || Ok(DmMcpHandler::new(Transport::Http)),
+        {
+            let content = Arc::clone(&content);
+            move || Ok(DmMcpHandler::new(Transport::Http, Arc::clone(&content)))
+        },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token()),
     );

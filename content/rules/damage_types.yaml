@@ -1,0 +1,16 @@
+# Standard damage types. Generic across d20-style systems; descriptions original.
+
+damage_types:
+  - { id: bludgeoning, physical: true,  description: "Crushing force — hammers, falling rocks, cudgels" }
+  - { id: piercing,    physical: true,  description: "Puncturing strikes — arrows, spears, fangs" }
+  - { id: slashing,    physical: true,  description: "Cleaving blows — swords, claws, axes" }
+  - { id: acid,        physical: false, description: "Corrosive fluid or vapour" }
+  - { id: cold,        physical: false, description: "Freezing temperatures or icy strikes" }
+  - { id: fire,        physical: false, description: "Heat, flame, thermal shock" }
+  - { id: force,       physical: false, description: "Raw magical energy, unaligned with any element" }
+  - { id: lightning,   physical: false, description: "Electrical discharge" }
+  - { id: necrotic,    physical: false, description: "Decay, withering of vital essence" }
+  - { id: poison,      physical: false, description: "Biological or alchemical toxins" }
+  - { id: psychic,     physical: false, description: "Direct assault on the mind" }
+  - { id: radiant,     physical: false, description: "Searing light or holy energy" }
+  - { id: thunder,     physical: false, description: "Concussive sound" }
