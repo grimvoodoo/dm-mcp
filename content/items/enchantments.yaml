@@ -1,0 +1,8 @@
+# One sample enchantment for Phase 2. See docs/items.md §Enchantments.
+
+enchantments:
+  glowing:
+    kind: utility
+    description: "A faint inner light; sheds dim illumination out to about ten feet."
+    value_premium_gp: 50
+    weight_delta: 0

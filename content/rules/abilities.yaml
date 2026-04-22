@@ -1,0 +1,29 @@
+# The six d20-inspired ability scores. See docs/checks.md for how these feed
+# into the resolve_check pipeline. Mechanically aligns with the 5.1 SRD
+# (CC-BY-4.0) — the convention of six abilities is pre-WotC and not protectable,
+# but our descriptions are original. See docs/ip-and-licensing.md.
+
+abilities:
+  - id: str
+    name: Strength
+    governs: "Physical power, carrying capacity, melee damage"
+
+  - id: dex
+    name: Dexterity
+    governs: "Agility, reflexes, balance, ranged accuracy"
+
+  - id: con
+    name: Constitution
+    governs: "Endurance, hit points, resisting poison and exhaustion"
+
+  - id: int
+    name: Intelligence
+    governs: "Reasoning, memory, arcane study"
+
+  - id: wis
+    name: Wisdom
+    governs: "Perception, intuition, attunement to the world"
+
+  - id: cha
+    name: Charisma
+    governs: "Force of personality, social presence, negotiation"

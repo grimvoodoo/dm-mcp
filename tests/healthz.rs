@@ -6,6 +6,7 @@
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
@@ -45,12 +46,14 @@ async fn wait_for_healthz(url: &str, timeout: Duration) -> anyhow::Result<reqwes
     ))
 }
 
-async fn spawn_http(port: u16) -> anyhow::Result<Child> {
+async fn spawn_http(port: u16, db_path: &std::path::Path) -> anyhow::Result<Child> {
     let child = Command::new(bin_path())
         .arg("http")
         .env("DMMCP_HTTP_BIND", "127.0.0.1")
         .env("DMMCP_HTTP_PORT", port.to_string())
         .env("DMMCP_LOG_LEVEL", "warn")
+        // Each test gets its own DB file so parallel tests don't race on migration.
+        .env("DMMCP_DB_PATH", db_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // Discard stderr — the tests don't assert on log output, and a piped-but-undrained
@@ -63,8 +66,10 @@ async fn spawn_http(port: u16) -> anyhow::Result<Child> {
 
 #[tokio::test]
 async fn healthz_returns_ok_when_http_transport_is_running() -> anyhow::Result<()> {
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("campaign.db");
     let port = test_port();
-    let mut child = spawn_http(port).await?;
+    let mut child = spawn_http(port, &db_path).await?;
 
     let url = format!("http://127.0.0.1:{port}/healthz");
     let resp = wait_for_healthz(&url, Duration::from_secs(10)).await?;
@@ -81,8 +86,10 @@ async fn healthz_returns_ok_when_http_transport_is_running() -> anyhow::Result<(
 async fn healthz_returns_ok_on_repeated_calls() -> anyhow::Result<()> {
     // Readiness / liveness probes hit /healthz repeatedly. Make sure we're not holding
     // state between calls that would cause drift.
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("campaign.db");
     let port = test_port() + 1;
-    let mut child = spawn_http(port).await?;
+    let mut child = spawn_http(port, &db_path).await?;
 
     let url = format!("http://127.0.0.1:{port}/healthz");
     // First call also serves as the warm-up wait.

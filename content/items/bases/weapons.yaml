@@ -1,0 +1,14 @@
+# One sample weapon base for Phase 2. The damage/weight/value fields align with
+# the 5.1 SRD's longsword entry; description is original. See docs/items.md and
+# docs/ip-and-licensing.md.
+
+weapons:
+  longsword:
+    name: Longsword
+    description: "A double-edged steel blade about three feet long. Versatile — can be wielded in one hand or two."
+    damage: 1d8
+    damage_type: slashing
+    weight_lb: 3
+    base_value_gp: 15
+    properties: [versatile]
+    slot: main-hand

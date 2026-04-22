@@ -1,0 +1,97 @@
+# Named conditions with their mechanical riders. resolve_check reads these at
+# check time; see docs/checks.md §Conditions. Condition names are generic RPG
+# vocabulary; descriptions and rider details are original.
+
+conditions:
+  blinded:
+    description: "The affected creature cannot rely on sight."
+    self:
+      attack_rolls: disadvantage
+      sight_checks: auto_fail
+    against:
+      attack_rolls: advantage
+
+  charmed:
+    description: "Dominated emotionally by the charmer; cannot attack them or target them with harmful effects."
+    self:
+      cannot_target_charmer: true
+    against:
+      social_checks_from_charmer: advantage
+
+  deafened:
+    description: "The affected creature cannot hear."
+    self:
+      hearing_checks: auto_fail
+
+  frightened:
+    description: "Afraid of a specific source; penalised near it."
+    self:
+      attack_rolls_in_sight_of_source: disadvantage
+      ability_checks_in_sight_of_source: disadvantage
+      can_approach_source: false
+
+  paralyzed:
+    description: "Rigid and helpless; cannot move or act."
+    self:
+      can_move: false
+      can_act: false
+      auto_fail: [save:str, save:dex]
+    against:
+      attack_rolls: advantage
+      auto_crit_if_melee_within_5ft: true
+
+  poisoned:
+    description: "Acutely ill; all rolls are less reliable."
+    self:
+      attack_rolls: disadvantage
+      ability_checks: disadvantage
+
+  prone:
+    description: "On the ground; slow to rise and off-balance."
+    self:
+      attack_rolls: disadvantage
+      move_speed_multiplier: 0.5
+    against:
+      attack_rolls_within_5ft: advantage
+      attack_rolls_beyond_5ft: disadvantage
+
+  stunned:
+    description: "Dazed and unresponsive."
+    self:
+      can_act: false
+      can_move: false
+      auto_fail: [save:str, save:dex]
+    against:
+      attack_rolls: advantage
+
+  unconscious:
+    description: "Senseless and incapacitated. Typically entered at 0 HP — see mortally_wounded."
+    self:
+      can_act: false
+      can_move: false
+      auto_fail: [save:str, save:dex]
+      drops_held_items: true
+    against:
+      attack_rolls: advantage
+      auto_crit_if_melee_within_5ft: true
+
+  mortally_wounded:
+    description: "At 0 HP and dying. Three failed death saves → dead; three successes → stabilised."
+    self:
+      can_act: false
+      hp_floor: 0
+
+  encumbered:
+    description: "Carrying more than is comfortable; slowed."
+    self:
+      speed_penalty: -10
+
+  exhaustion:
+    description: "Progressive fatigue. Severity 1-6; each level adds a penalty."
+    severity_levels:
+      1: { disadvantage_on: [ability_checks] }
+      2: { speed_halved: true }
+      3: { disadvantage_on: [attack_rolls, saves] }
+      4: { hp_max_halved: true }
+      5: { speed_zero: true }
+      6: { death: true }

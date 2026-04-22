@@ -1,13 +1,17 @@
 //! MCP server handler. Transport-agnostic: the same handler instance is attached to either
 //! the stdio or HTTP transport.
 //!
-//! Phase 1 registers a single tool — `server.info` — returning version and active transport.
-//! Later phases add the full tool surface via the same `#[tool_router]` pattern.
+//! Phase 1 registered `server.info`. Phase 2 adds `content.introspect`. Later phases add
+//! the full tool surface via the same `#[tool_router]` pattern.
+
+use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{CallToolResult, Content, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
+
+use crate::content::Content as ContentCatalog;
 
 /// The transport this server instance is currently serving. Reported by `server.info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,15 +45,17 @@ struct ServerInfoPayload {
 #[derive(Clone)]
 pub struct DmMcpHandler {
     transport: Transport,
+    content: Arc<ContentCatalog>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl DmMcpHandler {
-    pub fn new(transport: Transport) -> Self {
+    pub fn new(transport: Transport, content: Arc<ContentCatalog>) -> Self {
         Self {
             transport,
+            content,
             tool_router: Self::tool_router(),
         }
     }
@@ -73,6 +79,23 @@ impl DmMcpHandler {
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    /// Return a structured summary of every content section loaded at startup — one list
+    /// of IDs per section. Lets the DM agent confirm which catalog it's running against.
+    #[tool(
+        name = "content.introspect",
+        description = "Return the IDs of every entry loaded from the bundled YAML content catalog (abilities, skills, damage types, conditions, biomes, weapons, enchantments, archetypes)."
+    )]
+    async fn content_introspect(&self) -> Result<CallToolResult, McpError> {
+        let introspection = self.content.introspect();
+        let json = serde_json::to_string(&introspection).map_err(|e| {
+            McpError::internal_error(
+                format!("failed to serialize content.introspect payload: {e}"),
+                None,
+            )
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
@@ -87,8 +110,7 @@ impl ServerHandler for DmMcpHandler {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 1 skeleton — only server.info is live."
-                .to_string(),
+            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 2 adds the campaign DB and content catalog; server.info + content.introspect are live.".to_string(),
         );
         info
     }

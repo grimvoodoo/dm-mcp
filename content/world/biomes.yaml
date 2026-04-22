@@ -1,0 +1,11 @@
+# One sample biome for Phase 2. Later phases will add the full set. See
+# docs/world.md for the biome/zone model.
+
+biomes:
+  temperate_forest:
+    name: Temperate Forest
+    description: "Broadleaf woodland; dappled light and leaf-litter underfoot."
+    typical_kind: wilderness
+    typical_size_range: [small, large]
+    encounter_tags: [forest, wildlife, bandits_rare]
+    connection_count_range: [2, 4]
