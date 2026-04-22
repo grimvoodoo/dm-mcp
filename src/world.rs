@@ -407,7 +407,7 @@ struct EdgeRow {
     one_way: bool,
 }
 
-fn current_campaign_hour(conn: &Connection) -> Result<i64> {
+pub(crate) fn current_campaign_hour(conn: &Connection) -> Result<i64> {
     // The current world time is the maximum hour ever stamped on a non-pre-history event.
     // Pre-history (NPC backstory) events have negative campaign_hour so the WHERE clause
     // excludes them.

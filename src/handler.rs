@@ -17,16 +17,26 @@ use crate::characters::{
     self, ChangeRoleParams, CreateParams as CharCreateParams, GetParams, UpdatePlansParams,
 };
 use crate::checks::{self, ResolveCheckParams};
+use crate::combat::{
+    self, ApplyDamageParams, ApplyHealingParams, DeathEventParams, DeathSaveParams,
+    EndParams as CombatEndParams, NextTurnParams as CombatNextTurnParams,
+    StartParams as CombatStartParams,
+};
 use crate::conditions::{self, ApplyConditionParams, RemoveConditionParams};
 use crate::content::Content as ContentCatalog;
 use crate::db::DbHandle;
 use crate::dice;
 use crate::effects::{self, ApplyParams as EffectApplyParams, DispelParams};
+use crate::encounters::{
+    self, AbandonParams as EncAbandonParams, CompleteParams as EncCompleteParams,
+    CreateParams as EncCreateParams, FailParams as EncFailParams,
+};
 use crate::npcs::{self, GenerateParams as NpcGenerateParams, RecallParams as NpcRecallParams};
 use crate::proficiencies::{
     self, AdjustResourceParams, RemoveProficiencyParams, RemoveResourceParams,
     SetProficiencyParams, SetResourceParams,
 };
+use crate::rests::{self, LongRestParams, ShortRestParams};
 use crate::setup::{
     self, AnswerParams as SetupAnswerParams, GenerateWorldParams, MarkReadyParams,
     NewCampaignParams,
@@ -513,6 +523,166 @@ impl DmMcpHandler {
     ) -> Result<CallToolResult, McpError> {
         with_db(&self.db, |conn| npcs::recall(conn, params))
     }
+
+    // ── Encounters (Phase 9) ──────────────────────────────────────────────────
+
+    #[tool(
+        name = "encounter.create",
+        description = "Create an encounter with participants and an XP budget. Sides: player_side | hostile | neutral | ally. Returns the encounter_id + event_id."
+    )]
+    async fn encounter_create(
+        &self,
+        Parameters(params): Parameters<EncCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| encounters::create(conn, params))
+    }
+
+    #[tool(
+        name = "encounter.complete",
+        description = "Mark an encounter's goal as completed. Awards xp_budget * xp_modifier (default 1.0) split across player_side participants and emits encounter.goal_completed. The path is free-text — combat_victory / parley_to_peace / flight / side_swap / redirection / …"
+    )]
+    async fn encounter_complete(
+        &self,
+        Parameters(params): Parameters<EncCompleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| encounters::complete(conn, params))
+    }
+
+    #[tool(
+        name = "encounter.abandon",
+        description = "Mark an encounter as abandoned (no XP). Emits encounter.abandoned."
+    )]
+    async fn encounter_abandon(
+        &self,
+        Parameters(params): Parameters<EncAbandonParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| encounters::abandon(conn, params))
+    }
+
+    #[tool(
+        name = "encounter.fail",
+        description = "Mark an encounter as failed (no XP). Emits encounter.failed."
+    )]
+    async fn encounter_fail(
+        &self,
+        Parameters(params): Parameters<EncFailParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| encounters::fail(conn, params))
+    }
+
+    // ── Combat (Phase 9) ──────────────────────────────────────────────────────
+
+    #[tool(
+        name = "combat.start",
+        description = "Enter combat mode on an encounter. Rolls initiative for every participant (d20 + initiative_bonus), sets in_combat=1, round=1, turn_index=0. FIRST auto-ends any other encounter currently in combat, emitting combat.auto_ended on it."
+    )]
+    async fn combat_start(
+        &self,
+        Parameters(params): Parameters<CombatStartParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| combat::start(conn, params))
+    }
+
+    #[tool(
+        name = "combat.next_turn",
+        description = "Advance the initiative pointer. At a round boundary, decrements expires_after_rounds on every active effect / condition attached to a participant and deactivates any hitting zero (emits effect.expired / condition.expired)."
+    )]
+    async fn combat_next_turn(
+        &self,
+        Parameters(params): Parameters<CombatNextTurnParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| combat::next_turn(conn, params))
+    }
+
+    #[tool(
+        name = "combat.end",
+        description = "Leave combat mode on an encounter. Zeroes out the combat-only participant fields but keeps participant rows (participants outlast combat — see docs/encounters.md)."
+    )]
+    async fn combat_end(
+        &self,
+        Parameters(params): Parameters<CombatEndParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| combat::end(conn, params))
+    }
+
+    #[tool(
+        name = "combat.apply_damage",
+        description = "Reduce a character's hp_current by `amount` (non-negative). If HP hits 0 on a previously-alive character, applies mortally_wounded and sets status='unconscious'. Optional damage_type + source are recorded on the event."
+    )]
+    async fn combat_apply_damage(
+        &self,
+        Parameters(params): Parameters<ApplyDamageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| combat::apply_damage(conn, params))
+    }
+
+    #[tool(
+        name = "combat.apply_healing",
+        description = "Increase a character's hp_current by `amount` (non-negative), capped at hp_max. If the character is mortally_wounded and healed above 0 HP, clears the condition and resets death-save counters."
+    )]
+    async fn combat_apply_healing(
+        &self,
+        Parameters(params): Parameters<ApplyHealingParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| combat::apply_healing(conn, params))
+    }
+
+    #[tool(
+        name = "roll_death_save",
+        description = "Roll a d20 death save for an unconscious character. ≥10 success; <10 failure; nat 1 counts as two failures; nat 20 auto-stabilises (status='alive', hp=1, counters reset). Three successes → stabilised; three failures → status='dead'."
+    )]
+    async fn roll_death_save(
+        &self,
+        Parameters(params): Parameters<DeathSaveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| combat::roll_death_save(conn, params))
+    }
+
+    #[tool(
+        name = "roll_death_event",
+        description = "Roll the weighted death-events table from content/rules/death_events.yaml. Requires status='dead'. Returns the chosen event kind + description + outcome_hooks so the DM agent can narrate the aftermath (bargain, ghost-for-a-time, resurrection, etc.)."
+    )]
+    async fn roll_death_event(
+        &self,
+        Parameters(params): Parameters<DeathEventParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            combat::roll_death_event(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    // ── Rests (Phase 9) ───────────────────────────────────────────────────────
+
+    #[tool(
+        name = "rest.short",
+        description = "Short rest: refills resources with recharge='short_rest'. Does not restore HP."
+    )]
+    async fn rest_short(
+        &self,
+        Parameters(params): Parameters<ShortRestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| rests::short_rest(conn, params))
+    }
+
+    #[tool(
+        name = "rest.long",
+        description = "Long rest: refills resources with recharge ∈ {short_rest, long_rest, dawn}; restores HP to hp_max; clears death-save counters if alive. Refuses if the character is dead."
+    )]
+    async fn rest_long(
+        &self,
+        Parameters(params): Parameters<LongRestParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| rests::long_rest(conn, params))
+    }
 }
 
 #[tool_handler]
@@ -527,7 +697,7 @@ impl ServerHandler for DmMcpHandler {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 8 adds npc.generate (archetype-driven NPC creation with rolled stats, loadout, and synthesized backstory) and character.recall (event-log lookup with filters). Live tools: server.info, content.introspect, dice.roll, character.create, character.get, character.update_plans, character.change_role, character.recall, apply_effect, dispel_effect, proficiency.set, proficiency.remove, resource.set, resource.adjust, resource.remove, condition.apply, condition.remove, resolve_check, setup.new_campaign, setup.answer, setup.generate_world, setup.mark_ready, world.travel, world.map, world.describe_zone, npc.generate.".to_string(),
+            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 9 adds encounters (create/complete/abandon/fail with XP-by-goal flow), combat (start with stale-combat cleanup / next_turn with round-based effect+condition expiry / end / apply_damage / apply_healing), the death flow (roll_death_save + roll_death_event), and short/long rest tools. Live tools: server.info, content.introspect, dice.roll, character.*, apply_effect, dispel_effect, proficiency.*, resource.*, condition.*, resolve_check, setup.*, world.*, npc.generate, character.recall, encounter.*, combat.*, roll_death_save, roll_death_event, rest.short, rest.long.".to_string(),
         );
         info
     }
