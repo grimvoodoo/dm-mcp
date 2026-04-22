@@ -13,8 +13,17 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::characters::{
+    self, ChangeRoleParams, CreateParams as CharCreateParams, GetParams, UpdatePlansParams,
+};
 use crate::content::Content as ContentCatalog;
+use crate::db::DbHandle;
 use crate::dice;
+use crate::effects::{self, ApplyParams as EffectApplyParams, DispelParams};
+use crate::proficiencies::{
+    self, AdjustResourceParams, RemoveProficiencyParams, RemoveResourceParams,
+    SetProficiencyParams, SetResourceParams,
+};
 
 /// Arguments for the `dice.roll` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -22,6 +31,40 @@ pub struct DiceRollParams {
     /// Dice notation. Accepted shapes: `d4`/`d6`/`d8`/`d10`/`d12`/`d20`/`d100` (single die),
     /// `3d6` (count × sides), or `11-43` (inclusive integer range).
     pub spec: String,
+}
+
+/// Small helper — take a mutex on the DB, run a callback, serialise the result as JSON
+/// inside a CallToolResult. Keeps tool bodies tight.
+fn with_db_mut<F, T>(db: &DbHandle, f: F) -> Result<CallToolResult, McpError>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T>,
+    T: Serialize,
+{
+    let value = {
+        let mut conn = db
+            .lock()
+            .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+        f(&mut conn).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+    };
+    let json = serde_json::to_string(&value)
+        .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+fn with_db<F, T>(db: &DbHandle, f: F) -> Result<CallToolResult, McpError>
+where
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T>,
+    T: Serialize,
+{
+    let value = {
+        let conn = db
+            .lock()
+            .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+        f(&conn).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+    };
+    let json = serde_json::to_string(&value)
+        .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 /// The transport this server instance is currently serving. Reported by `server.info`.
@@ -57,16 +100,18 @@ struct ServerInfoPayload {
 pub struct DmMcpHandler {
     transport: Transport,
     content: Arc<ContentCatalog>,
+    db: DbHandle,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl DmMcpHandler {
-    pub fn new(transport: Transport, content: Arc<ContentCatalog>) -> Self {
+    pub fn new(transport: Transport, content: Arc<ContentCatalog>, db: DbHandle) -> Self {
         Self {
             transport,
             content,
+            db,
             tool_router: Self::tool_router(),
         }
     }
@@ -126,6 +171,143 @@ impl DmMcpHandler {
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    // ── Character CRUD ────────────────────────────────────────────────────────
+
+    #[tool(
+        name = "character.create",
+        description = "Create a new character (player, companion, pet, friendly NPC, or enemy). Takes name + role + six ability scores plus optional combat/label fields. Returns {character_id, event_id}."
+    )]
+    async fn character_create(
+        &self,
+        Parameters(params): Parameters<CharCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| characters::create(conn, params))
+    }
+
+    #[tool(
+        name = "character.get",
+        description = "Read a character's full state: base + effective ability scores (with active effects composed), HP/AC/speed, proficiencies, resources, active effects, active conditions."
+    )]
+    async fn character_get(
+        &self,
+        Parameters(GetParams { character_id }): Parameters<GetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db(&self.db, |conn| characters::get(conn, character_id))
+    }
+
+    #[tool(
+        name = "character.update_plans",
+        description = "Replace a character's `plans` prose (their current agenda / motivations). Emits npc.plan_changed."
+    )]
+    async fn character_update_plans(
+        &self,
+        Parameters(params): Parameters<UpdatePlansParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| characters::update_plans(conn, params))
+    }
+
+    #[tool(
+        name = "character.change_role",
+        description = "Change a character's role (player/companion/friendly/enemy/neutral). Records the pivot in the event log with before/after + narrative reason."
+    )]
+    async fn character_change_role(
+        &self,
+        Parameters(params): Parameters<ChangeRoleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| characters::change_role(conn, params))
+    }
+
+    // ── Effects ───────────────────────────────────────────────────────────────
+
+    #[tool(
+        name = "apply_effect",
+        description = "Apply a temporary numerical modifier to a character. Never mutates base stats — stored as a row consumed by effective-stat composition. Emits effect.applied."
+    )]
+    async fn apply_effect(
+        &self,
+        Parameters(params): Parameters<EffectApplyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| effects::apply(conn, params))
+    }
+
+    #[tool(
+        name = "dispel_effect",
+        description = "Deactivate an active effect (e.g. potion wears off, curse lifted). Emits effect.expired with expiry_reason=dispelled."
+    )]
+    async fn dispel_effect(
+        &self,
+        Parameters(params): Parameters<DispelParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| effects::dispel(conn, params))
+    }
+
+    // ── Proficiencies ─────────────────────────────────────────────────────────
+
+    #[tool(
+        name = "proficiency.set",
+        description = "Upsert a character proficiency (skill, save like 'save:con', weapon, tool, or custom growth skill like 'bite'). Fields: name, proficient, expertise (doubles prof bonus), ranks (flat additive)."
+    )]
+    async fn proficiency_set(
+        &self,
+        Parameters(params): Parameters<SetProficiencyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| {
+            proficiencies::set_proficiency(conn, params)
+        })
+    }
+
+    #[tool(
+        name = "proficiency.remove",
+        description = "Remove a character's proficiency row. Idempotent."
+    )]
+    async fn proficiency_remove(
+        &self,
+        Parameters(params): Parameters<RemoveProficiencyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| {
+            proficiencies::remove_proficiency(conn, params)
+        })
+    }
+
+    // ── Resources ─────────────────────────────────────────────────────────────
+
+    #[tool(
+        name = "resource.set",
+        description = "Upsert a character resource (spell slot, mana, ki, hit_die, etc). Name is namespaced (e.g. 'slot:1'..'slot:9'). Recharge ∈ short_rest|long_rest|dawn|never|manual."
+    )]
+    async fn resource_set(
+        &self,
+        Parameters(params): Parameters<SetResourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| proficiencies::set_resource(conn, params))
+    }
+
+    #[tool(
+        name = "resource.adjust",
+        description = "Change a character resource's current value by a signed delta. Clamped to [0, max]. Requires the resource to exist."
+    )]
+    async fn resource_adjust(
+        &self,
+        Parameters(params): Parameters<AdjustResourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| {
+            proficiencies::adjust_resource(conn, params)
+        })
+    }
+
+    #[tool(
+        name = "resource.remove",
+        description = "Remove a resource row entirely. Idempotent."
+    )]
+    async fn resource_remove(
+        &self,
+        Parameters(params): Parameters<RemoveResourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| {
+            proficiencies::remove_resource(conn, params)
+        })
+    }
 }
 
 #[tool_handler]
@@ -140,7 +322,7 @@ impl ServerHandler for DmMcpHandler {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 3 adds dice rolling. Live tools: server.info, content.introspect, dice.roll.".to_string(),
+            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 4 adds character CRUD with effective-stat composition, effects apply/dispel, proficiencies CRUD, resources CRUD. Live tools: server.info, content.introspect, dice.roll, character.create, character.get, character.update_plans, character.change_role, apply_effect, dispel_effect, proficiency.set, proficiency.remove, resource.set, resource.adjust, resource.remove.".to_string(),
         );
         info
     }
