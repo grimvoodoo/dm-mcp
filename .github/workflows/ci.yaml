@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same branch when a new push arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── 1. Format ──────────────────────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: arc-runner-dm-mcp
+    steps:
+      # rustfmt is a pure Rust binary — no C toolchain needed.
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ── 2. Clippy ─────────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: arc-runner-dm-mcp
+    steps:
+      - name: Install system dependencies
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y build-essential pkg-config && break
+            echo "apt-get attempt $i failed; retrying in 10 s..."
+            sleep 10
+          done
+
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy — deny all warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  # ── 3. Tests ──────────────────────────────────────────────────────────────
+  # Unit tests + integration tests. tests/*.rs spawn the compiled binary and
+  # drive it through real MCP protocol. No external services — SQLite is
+  # embedded, and the MCP has no auth/persistence dependencies that outlive
+  # the process.
+  test:
+    name: Tests
+    runs-on: arc-runner-dm-mcp
+    needs: [fmt, clippy]
+    steps:
+      - name: Install system dependencies
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y build-essential pkg-config && break
+            echo "apt-get attempt $i failed; retrying in 10 s..."
+            sleep 10
+          done
+
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build (release — verifies the release profile compiles clean)
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test
+
+  # ── 4. No-OpenSSL audit ───────────────────────────────────────────────────
+  # Project rule: all TLS must go through rustls. OpenSSL breaks the `scratch`
+  # container build. If a new or updated dep drags openssl / openssl-sys /
+  # native-tls into the tree, fail the build so the regression is caught
+  # before merge.
+  no-openssl:
+    name: No OpenSSL
+    runs-on: arc-runner-dm-mcp
+    steps:
+      - name: Install system dependencies
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y build-essential pkg-config && break
+            echo "apt-get attempt $i failed; retrying in 10 s..."
+            sleep 10
+          done
+
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify openssl is not in the dependency tree
+        run: |
+          for crate in openssl openssl-sys native-tls; do
+            if cargo tree -i "$crate" >/dev/null 2>&1; then
+              echo "ERROR: $crate is in the dependency tree — rustls only" >&2
+              cargo tree -i "$crate"
+              exit 1
+            fi
+          done
+          echo "OK: no openssl/openssl-sys/native-tls in the tree"
