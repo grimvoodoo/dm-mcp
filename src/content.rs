@@ -115,8 +115,72 @@ pub struct Archetype {
     pub id: String,
     pub species: String,
     pub role_hint: String,
-    #[serde(flatten)]
+    /// `[min, max]` years.
+    #[serde(default)]
+    pub typical_age_years: Option<[i32; 2]>,
+    /// `{ str: [14, 18], dex: [10, 14], ... }` — inclusive ranges, per ability id.
+    #[serde(default)]
+    pub stats: BTreeMap<String, [i32; 2]>,
+    /// Dice expression with `con_mod` interpolation. Currently consumed by `npcs::generate`.
+    #[serde(default)]
+    pub hp_formula: Option<String>,
+    #[serde(default)]
+    pub ac_base: Option<i32>,
+    #[serde(default)]
+    pub speed_ft: Option<i32>,
+    #[serde(default)]
+    pub proficiencies: Vec<ArchetypeProficiency>,
+    #[serde(default)]
+    pub loadout: Vec<ArchetypeLoadoutEntry>,
+    #[serde(default)]
+    pub plan_pool: Vec<String>,
+    #[serde(default)]
+    pub ideology_pool: Vec<String>,
+    #[serde(default)]
+    pub backstory_hooks: Vec<String>,
+    #[serde(default)]
+    pub hostile_triggers: Vec<String>,
+    #[serde(default)]
+    pub peace_hooks: Vec<String>,
+    /// Catch-all for forward-compat / agent-readable fields not yet mechanised.
+    #[serde(default, flatten)]
     pub extra: BTreeMap<String, serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchetypeProficiency {
+    pub name: String,
+    #[serde(default)]
+    pub proficient: bool,
+    #[serde(default)]
+    pub expertise: bool,
+    #[serde(default)]
+    pub ranks: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchetypeLoadoutEntry {
+    pub base_kind: String,
+    /// 0.0..=1.0 — probability the entry produces an item at generation time.
+    pub chance: f32,
+    #[serde(default)]
+    pub material: Option<String>,
+    #[serde(default)]
+    pub material_tier: Option<i32>,
+    /// Optional dice expression (e.g. `2d6`) for stackable items like gold.
+    #[serde(default)]
+    pub quantity_dice: Option<String>,
+    #[serde(default)]
+    pub equip: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamePool {
+    pub species: String,
+    #[serde(default)]
+    pub first: Vec<String>,
+    #[serde(default)]
+    pub last: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +208,7 @@ pub struct Content {
     pub weapons: BTreeMap<String, serde_yaml_ng::Value>,
     pub enchantments: BTreeMap<String, serde_yaml_ng::Value>,
     pub archetypes: BTreeMap<String, Archetype>,
+    pub name_pools: BTreeMap<String, NamePool>,
     pub setup_questions: Vec<SetupQuestion>,
 }
 
@@ -187,10 +252,18 @@ impl Content {
         // source we're using. Embedded and on-disk use the same iteration logic so a new
         // archetype file is picked up by both paths automatically.
         let mut archetypes = BTreeMap::new();
-        let archetype_sources = list_archetype_files(override_dir)?;
+        let archetype_sources = list_yaml_files_under(override_dir, "npcs/archetypes")?;
         for src in &archetype_sources {
             let a: Archetype = parse(src)?;
             archetypes.insert(a.id.clone(), a);
+        }
+
+        // Name pools: same auto-discovery shape; keyed by `species`.
+        let mut name_pools = BTreeMap::new();
+        let pool_sources = list_yaml_files_under(override_dir, "npcs/name_pools")?;
+        for src in &pool_sources {
+            let np: NamePool = parse(src)?;
+            name_pools.insert(np.species.clone(), np);
         }
 
         Self::assemble(
@@ -202,6 +275,7 @@ impl Content {
             weapons.weapons,
             enchantments.enchantments,
             archetypes,
+            name_pools,
             setup_questions.questions,
         )
     }
@@ -216,6 +290,7 @@ impl Content {
         weapons: BTreeMap<String, serde_yaml_ng::Value>,
         enchantments: BTreeMap<String, serde_yaml_ng::Value>,
         archetypes: BTreeMap<String, Archetype>,
+        name_pools: BTreeMap<String, NamePool>,
         setup_questions: Vec<SetupQuestion>,
     ) -> Result<Self> {
         let content = Self {
@@ -227,6 +302,7 @@ impl Content {
             weapons,
             enchantments,
             archetypes,
+            name_pools,
             setup_questions,
         };
         content.validate()?;
@@ -263,6 +339,7 @@ impl Content {
             weapons: self.weapons.keys().cloned().collect(),
             enchantments: self.enchantments.keys().cloned().collect(),
             archetypes: self.archetypes.keys().cloned().collect(),
+            name_pools: self.name_pools.keys().cloned().collect(),
             setup_questions: self.setup_questions.iter().map(|q| q.id.clone()).collect(),
         }
     }
@@ -360,6 +437,7 @@ pub struct Introspection {
     pub weapons: Vec<String>,
     pub enchantments: Vec<String>,
     pub archetypes: Vec<String>,
+    pub name_pools: Vec<String>,
     pub setup_questions: Vec<String>,
 }
 
@@ -390,15 +468,20 @@ fn get<'a>(override_dir: Option<&Path>, rel: &'a str) -> Result<YamlSource<'a>> 
     }
 }
 
-/// Enumerate every `*.yaml` / `*.yml` under `npcs/archetypes/` in whichever source is active.
-fn list_archetype_files<'a>(override_dir: Option<&Path>) -> Result<Vec<YamlSource<'a>>> {
+/// Enumerate every `*.yaml` / `*.yml` under `<content>/<rel_dir>/`. Returns an empty list
+/// when the directory is absent — used for both archetype YAMLs and name-pool YAMLs, the
+/// latter possibly missing in older content snapshots.
+fn list_yaml_files_under<'a>(
+    override_dir: Option<&Path>,
+    rel_dir: &str,
+) -> Result<Vec<YamlSource<'a>>> {
     let mut out = Vec::new();
     match override_dir {
         Some(dir) => {
-            let archetype_dir = dir.join("npcs/archetypes");
-            if archetype_dir.is_dir() {
-                for entry in std::fs::read_dir(&archetype_dir)
-                    .with_context(|| format!("read archetype dir {}", archetype_dir.display()))?
+            let abs = dir.join(rel_dir);
+            if abs.is_dir() {
+                for entry in std::fs::read_dir(&abs)
+                    .with_context(|| format!("read content dir {}", abs.display()))?
                 {
                     let entry = entry?;
                     let path = entry.path();
@@ -414,23 +497,19 @@ fn list_archetype_files<'a>(override_dir: Option<&Path>) -> Result<Vec<YamlSourc
             }
         }
         None => {
-            let archetype_dir = CONTENT_DIR
-                .get_dir("npcs/archetypes")
-                .context("embedded content missing npcs/archetypes/")?;
-            // We deliberately iterate `files()` (non-recursive) rather than `find("*.yaml")`
-            // so the list tracks the on-disk walker exactly.
-            for file in archetype_dir.files() {
-                let path = file.path();
-                if is_yaml_file(path) {
-                    let source = file
-                        .contents_utf8()
-                        .with_context(|| format!("embedded {} is not UTF-8", path.display()))?;
-                    // include_dir owns the &str for &'static program lifetime; we can keep
-                    // a static reference to the path too.
-                    out.push(YamlSource::Embedded {
-                        path: static_path_str(path),
-                        source,
-                    });
+            // Embedded copy may not contain this subdir — treat absence as "no files".
+            if let Some(d) = CONTENT_DIR.get_dir(rel_dir) {
+                for file in d.files() {
+                    let path = file.path();
+                    if is_yaml_file(path) {
+                        let source = file
+                            .contents_utf8()
+                            .with_context(|| format!("embedded {} is not UTF-8", path.display()))?;
+                        out.push(YamlSource::Embedded {
+                            path: static_path_str(path),
+                            source,
+                        });
+                    }
                 }
             }
         }
@@ -504,6 +583,7 @@ mod tests {
             weapons: BTreeMap::new(),
             enchantments: BTreeMap::new(),
             archetypes: BTreeMap::new(),
+            name_pools: BTreeMap::new(),
             setup_questions: vec![],
         };
         let err = content

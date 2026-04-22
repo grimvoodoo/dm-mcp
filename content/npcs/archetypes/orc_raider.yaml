@@ -1,0 +1,63 @@
+# Orc raider archetype.
+#
+# Per docs/npcs.md, archetypes describe role + current faction, not species essence —
+# `orc_raider` is an orc who is currently raiding, not "the orc archetype". An
+# `orc_merchant` would be the same species in a completely different context, and is a
+# valid future addition. There is no alignment field; hostility is contextual via
+# `hostile_triggers` + ideology + the encounter's framing.
+
+id: orc_raider
+species: orc
+role_hint: enemy
+typical_age_years: [18, 45]
+
+stats:
+  str: [14, 18]
+  dex: [10, 14]
+  con: [14, 18]
+  int: [6, 10]
+  wis: [8, 12]
+  cha: [6, 10]
+
+hp_formula: "3d8 + con_mod*3"
+ac_base: 13
+speed_ft: 30
+
+proficiencies:
+  - { name: "save:str",     proficient: true }
+  - { name: "save:con",     proficient: true }
+  - { name: "intimidation", proficient: true }
+  - { name: "survival",     proficient: true }
+  - { name: "greataxe",     proficient: true }
+
+loadout:
+  - { base_kind: greataxe,      chance: 0.7,  material: iron,    material_tier: 1 }
+  - { base_kind: handaxe,       chance: 0.5,  material: iron,    material_tier: 1 }
+  - { base_kind: leather_armor, chance: 0.9,  material: leather, material_tier: 1 }
+  - { base_kind: gold,          chance: 1.0,  quantity_dice: "2d6" }
+
+plan_pool:
+  - "Raiding nearby settlements for loot and captives"
+  - "Avenging the death of a clanmate killed by settlers"
+  - "Seeking a lost tribal relic taken during a settler raid"
+  - "Earning honour for their warband"
+
+ideology_pool:
+  - "Strength is the only virtue worth respecting. The weak exist to be ruled."
+  - "Loyal only to the warband, suspicious of outsiders, honours debts in blood."
+  - "The clan came first; everything else can be sacrificed for it."
+
+hostile_triggers:
+  - "Encounter their warband in raided territory; strangers are presumed spies."
+
+peace_hooks:
+  - "Accepts a truce if offered blood-debt payment (3+ gold per clanmate lost)"
+  - "Will side-swap if shown convincing evidence of their war-chief's treachery"
+  - "Backs down if the party yields with dignity and leaves territory"
+
+backstory_hooks:
+  - "Raided ${settlement} ${years_ago} years ago, after ${oppressor} ${past_wrong_against_orcs}"
+  - "Killed ${enemy_archetype} in single combat over ${cause}"
+  - "Fled from ${stronger_foe} after losing the duel"
+  - "Was exiled from ${tribe} for breaking a sacred law"
+  - "Carries a trophy taken from ${victim} at ${place}"
