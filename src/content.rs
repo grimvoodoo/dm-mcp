@@ -87,6 +87,11 @@ struct SetupQuestionsFile {
     questions: Vec<SetupQuestion>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeathEventsFile {
+    death_events: Vec<DeathEvent>,
+}
+
 // ── Public content types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +189,17 @@ pub struct NamePool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeathEvent {
+    pub kind: String,
+    pub weight: i32,
+    pub description: String,
+    #[serde(default)]
+    pub outcome_hooks: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupQuestion {
     pub id: String,
     pub prompt: String,
@@ -210,6 +226,7 @@ pub struct Content {
     pub archetypes: BTreeMap<String, Archetype>,
     pub name_pools: BTreeMap<String, NamePool>,
     pub setup_questions: Vec<SetupQuestion>,
+    pub death_events: Vec<DeathEvent>,
 }
 
 /// Source of a single YAML file's bytes. Hides the difference between embedded (`&'static
@@ -247,6 +264,7 @@ impl Content {
         let enchantments: EnchantmentsFile = parse(&get(override_dir, "items/enchantments.yaml")?)?;
         let setup_questions: SetupQuestionsFile =
             parse(&get(override_dir, "campaign/setup_questions.yaml")?)?;
+        let death_events: DeathEventsFile = parse(&get(override_dir, "rules/death_events.yaml")?)?;
 
         // Archetypes: discover every *.yaml / *.yml under npcs/archetypes/ in whichever
         // source we're using. Embedded and on-disk use the same iteration logic so a new
@@ -277,6 +295,7 @@ impl Content {
             archetypes,
             name_pools,
             setup_questions.questions,
+            death_events.death_events,
         )
     }
 
@@ -292,6 +311,7 @@ impl Content {
         archetypes: BTreeMap<String, Archetype>,
         name_pools: BTreeMap<String, NamePool>,
         setup_questions: Vec<SetupQuestion>,
+        death_events: Vec<DeathEvent>,
     ) -> Result<Self> {
         let content = Self {
             abilities,
@@ -304,6 +324,7 @@ impl Content {
             archetypes,
             name_pools,
             setup_questions,
+            death_events,
         };
         content.validate()?;
         Ok(content)
@@ -341,6 +362,7 @@ impl Content {
             archetypes: self.archetypes.keys().cloned().collect(),
             name_pools: self.name_pools.keys().cloned().collect(),
             setup_questions: self.setup_questions.iter().map(|q| q.id.clone()).collect(),
+            death_events: self.death_events.iter().map(|d| d.kind.clone()).collect(),
         }
     }
 }
@@ -439,6 +461,7 @@ pub struct Introspection {
     pub archetypes: Vec<String>,
     pub name_pools: Vec<String>,
     pub setup_questions: Vec<String>,
+    pub death_events: Vec<String>,
 }
 
 // ── Source lookup ─────────────────────────────────────────────────────────────
@@ -585,6 +608,7 @@ mod tests {
             archetypes: BTreeMap::new(),
             name_pools: BTreeMap::new(),
             setup_questions: vec![],
+            death_events: vec![],
         };
         let err = content
             .validate()

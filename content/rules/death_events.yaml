@@ -1,0 +1,33 @@
+# Weighted table rolled by `roll_death_event` after three failed death saves.
+# Original outcome descriptions — no SRD/WotC text. See docs/characters.md §Death.
+#
+# Each event carries a `weight` (integer ≥ 1) used for the weighted pick and a `kind`
+# identifier the DM agent can branch on. `outcome_hooks` are opaque prose tags the agent
+# can interpret. `description` is the narrative seed — the agent expands it.
+
+death_events:
+  - kind: plain_end
+    weight: 5
+    description: "The character's story ends here. Their body lies still; whatever they carried is left to those they leave behind."
+    outcome_hooks: []
+
+  - kind: audience_with_death_god
+    weight: 2
+    description: "The character finds themselves in a silent hall at the edge of the world, face to face with the one who tends the dead."
+    outcome_hooks: [bargain, quest, servitude]
+
+  - kind: resurrected_by_ally
+    weight: 1
+    description: "A companion's grief — or a stranger's unlikely kindness — calls them back across the threshold."
+    outcome_hooks: [return_alive]
+    requires: [companion_nearby_or_zone_has_cleric]
+
+  - kind: cursed_return
+    weight: 1
+    description: "Something brings them back, but they return changed — a mark, a hunger, a whisper they cannot silence."
+    outcome_hooks: [permanent_condition]
+
+  - kind: ghost_for_a_time
+    weight: 1
+    description: "The character walks as a shade, visible only to the one who loved them, until their last errand is done."
+    outcome_hooks: [ephemeral_return, unfinished_business]
