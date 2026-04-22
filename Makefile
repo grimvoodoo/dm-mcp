@@ -212,24 +212,34 @@ _service-start: _sweep-stale
 	 DMMCP_LOG_LEVEL="$(LOG_LEVEL)" \
 	 ./target/debug/dm-mcp http > $(LOG_DIR)/dm-mcp.log 2>&1 & \
 	 echo $$! > $(PID_DIR)/dm-mcp.pid
-	@printf "  Waiting for /healthz"
-	@for i in $$(seq 1 50); do \
-		if curl -sf http://$(HTTP_BIND):$(HTTP_PORT)/healthz > /dev/null 2>&1; then \
-			echo " ready"; \
-			echo "  pid: $$(cat $(PID_DIR)/dm-mcp.pid) — log: $(LOG_DIR)/dm-mcp.log"; \
-			exit 0; \
-		fi; \
-		if ! kill -0 "$$(cat $(PID_DIR)/dm-mcp.pid)" 2>/dev/null; then \
+	@pid=$$(cat $(PID_DIR)/dm-mcp.pid); \
+	printf "  Waiting for /healthz"; \
+	for i in $$(seq 1 50); do \
+		if ! kill -0 "$$pid" 2>/dev/null; then \
 			echo ""; \
-			echo "✗ dm-mcp exited before /healthz came up. Last log lines:"; \
+			echo "✗ dm-mcp (pid $$pid) exited before /healthz came up. Last log lines:"; \
 			tail -n 20 $(LOG_DIR)/dm-mcp.log; \
 			rm -f $(PID_DIR)/dm-mcp.pid; \
 			exit 1; \
+		fi; \
+		if curl -sf http://$(HTTP_BIND):$(HTTP_PORT)/healthz > /dev/null 2>&1; then \
+			echo " ready"; \
+			echo "  pid: $$pid — log: $(LOG_DIR)/dm-mcp.log"; \
+			exit 0; \
 		fi; \
 		printf '.'; sleep 0.2; \
 	done; \
 	echo ""; \
 	echo "✗ Server did not come up within 10s. See $(LOG_DIR)/dm-mcp.log"; \
+	if kill -0 "$$pid" 2>/dev/null; then \
+		echo "  killing leftover process (pid $$pid)..."; \
+		kill "$$pid" 2>/dev/null || true; \
+		sleep 1; \
+		if kill -0 "$$pid" 2>/dev/null; then \
+			kill -9 "$$pid" 2>/dev/null || true; \
+		fi; \
+	fi; \
+	rm -f $(PID_DIR)/dm-mcp.pid; \
 	exit 1
 
 _service-stop: _sweep-stale
