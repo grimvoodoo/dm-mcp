@@ -242,6 +242,86 @@ impl Content {
     }
 }
 
+// ── Condition rider accessors ──────────────────────────────────────────────────
+//
+// Phase 5's `resolve_check` needs to know: does condition X impose advantage /
+// disadvantage / auto-fail on check kind Y for the character WHO IS affected? We keep the
+// raw rider payload as `serde_yaml_ng::Value` in `Content.conditions` so the DM agent can
+// read any field we don't yet mechanise — these accessors carve out the narrow set the
+// check pipeline acts on.
+
+/// Roll-level modifier on a specific check kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollModifier {
+    Advantage,
+    Disadvantage,
+    AutoFail,
+    AutoSucceed,
+}
+
+/// Categories of check the rider table may modify. Keep the string form aligned with the
+/// YAML keys so content authors don't have to remember a separate enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    AttackRoll,
+    AbilityCheck,
+    SkillCheck,
+    SavingThrow,
+}
+
+impl CheckKind {
+    /// YAML key this check kind is matched against in the `self` rider block.
+    pub fn rider_key(&self) -> &'static str {
+        match self {
+            CheckKind::AttackRoll => "attack_rolls",
+            CheckKind::AbilityCheck => "ability_checks",
+            // Skill checks are a sub-class of ability checks mechanically; the rider table
+            // can target them via either key.
+            CheckKind::SkillCheck => "ability_checks",
+            CheckKind::SavingThrow => "saves",
+        }
+    }
+}
+
+impl Content {
+    /// Look up the `self.<kind>` rider for the given condition id. Returns `None` if the
+    /// condition is unknown or the rider field is absent.
+    pub fn self_rider_for(&self, condition: &str, kind: CheckKind) -> Option<RollModifier> {
+        let cond = self.conditions.get(condition)?;
+        let self_block = cond.get("self")?;
+        let val = self_block.get(kind.rider_key())?;
+        parse_roll_modifier(val)
+    }
+
+    /// Returns true if the given check-key (e.g. `save:str`) is in the condition's
+    /// `self.auto_fail` list.
+    pub fn condition_auto_fails(&self, condition: &str, check_key: &str) -> bool {
+        let Some(cond) = self.conditions.get(condition) else {
+            return false;
+        };
+        let Some(self_block) = cond.get("self") else {
+            return false;
+        };
+        match self_block.get("auto_fail") {
+            Some(serde_yaml_ng::Value::Sequence(seq)) => seq
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s == check_key)),
+            _ => false,
+        }
+    }
+}
+
+fn parse_roll_modifier(v: &serde_yaml_ng::Value) -> Option<RollModifier> {
+    match v.as_str()? {
+        "advantage" => Some(RollModifier::Advantage),
+        "disadvantage" => Some(RollModifier::Disadvantage),
+        "auto_fail" => Some(RollModifier::AutoFail),
+        "auto_succeed" => Some(RollModifier::AutoSucceed),
+        _ => None,
+    }
+}
+
 /// Structured summary returned by `content.introspect`. JSON-serialisable so the handler
 /// can ship it straight to the MCP client.
 #[derive(Debug, Serialize, Deserialize)]

@@ -12,6 +12,8 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 mod characters;
+mod checks;
+mod conditions;
 mod config;
 mod content;
 mod db;
