@@ -13,6 +13,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::barter::{self, ExchangeParams as BarterExchangeParams};
 use crate::characters::{
     self, ChangeRoleParams, CreateParams as CharCreateParams, GetParams, UpdatePlansParams,
 };
@@ -30,6 +31,11 @@ use crate::effects::{self, ApplyParams as EffectApplyParams, DispelParams};
 use crate::encounters::{
     self, AbandonParams as EncAbandonParams, CompleteParams as EncCompleteParams,
     CreateParams as EncCreateParams, FailParams as EncFailParams,
+};
+use crate::inventory::{
+    self, CreateParams as InvCreateParams, DropParams, EquipParams, GetParams as InvGetParams,
+    InspectParams as InvInspectParams, PickupParams, TransferParams as InvTransferParams,
+    UnequipParams,
 };
 use crate::npcs::{self, GenerateParams as NpcGenerateParams, RecallParams as NpcRecallParams};
 use crate::proficiencies::{
@@ -683,6 +689,210 @@ impl DmMcpHandler {
     ) -> Result<CallToolResult, McpError> {
         with_db_mut(&self.db, |conn| rests::long_rest(conn, params))
     }
+
+    // ── Inventory (Phase 10) ──────────────────────────────────────────────────
+
+    #[tool(
+        name = "inventory.create",
+        description = "Create a new item instance. Exactly one of holder_character_id / zone_location_id / container_item_id must be set. base_kind must match a bundled content item base. Stackables accept quantity > 1."
+    )]
+    async fn inventory_create(
+        &self,
+        Parameters(params): Parameters<InvCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::create(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "inventory.pickup",
+        description = "Character picks up a zone-located item. Refuses if carried weight would exceed overloaded_threshold_pct (default 100%) — returns {error:'would_overload', ...}. Applies the 'encumbered' condition if carried weight crosses encumbered_threshold_pct (default 67%)."
+    )]
+    async fn inventory_pickup(
+        &self,
+        Parameters(params): Parameters<PickupParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::pickup(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        // Returns a Result<PickupResult, PickupRefused> — serialize either side.
+        let json = match value {
+            Ok(ok) => serde_json::to_string(&ok),
+            Err(refused) => serde_json::to_string(&refused),
+        }
+        .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "inventory.drop",
+        description = "Character drops a held item into their current zone. Re-evaluates encumbrance; crossing back below encumbered_threshold_pct clears the 'encumbered' condition."
+    )]
+    async fn inventory_drop(
+        &self,
+        Parameters(params): Parameters<DropParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::drop_item(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "inventory.equip",
+        description = "Set equipped_slot on a held item (main-hand, off-hand, head, chest, …). Requires the character to hold the item."
+    )]
+    async fn inventory_equip(
+        &self,
+        Parameters(params): Parameters<EquipParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::equip(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "inventory.unequip",
+        description = "Clear equipped_slot on a held item."
+    )]
+    async fn inventory_unequip(
+        &self,
+        Parameters(params): Parameters<UnequipParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::unequip(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "inventory.get",
+        description = "Full inventory readout for a character: every held item with effective_weight_lb and effective_value_gp, plus carried_weight_lb / capacity_lb / percent_of_capacity / encumbered flag."
+    )]
+    async fn inventory_get(
+        &self,
+        Parameters(InvGetParams { character_id }): Parameters<InvGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::get(&conn, &content, character_id)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "inventory.inspect",
+        description = "Effective stats of a single item (weight, value) composed from its base kind + quantity."
+    )]
+    async fn inventory_inspect(
+        &self,
+        Parameters(InvInspectParams { item_id }): Parameters<InvInspectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::inspect(&conn, &content, item_id)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "inventory.transfer",
+        description = "Move an item to a new location. Exactly one of to_character_id / to_container_item_id / to_zone_location_id must be set. Does not apply encumbrance checks — prefer inventory.pickup for gear the character is picking up."
+    )]
+    async fn inventory_transfer(
+        &self,
+        Parameters(params): Parameters<InvTransferParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            inventory::transfer(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "barter.exchange",
+        description = "Barter items (and gold) between the player and a merchant. Auto-accepts offers at or above 90% of requested value; refuses manifestly bad deals (below 50%); otherwise rolls a persuasion check against a DC derived from the value gap. On success, both inventories swap atomically. dc_override available for DM-authored trades."
+    )]
+    async fn barter_exchange(
+        &self,
+        Parameters(params): Parameters<BarterExchangeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            barter::exchange(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
@@ -697,7 +907,7 @@ impl ServerHandler for DmMcpHandler {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 9 adds encounters (create/complete/abandon/fail with XP-by-goal flow), combat (start with stale-combat cleanup / next_turn with round-based effect+condition expiry / end / apply_damage / apply_healing), the death flow (roll_death_save + roll_death_event), and short/long rest tools. Live tools: server.info, content.introspect, dice.roll, character.*, apply_effect, dispel_effect, proficiency.*, resource.*, condition.*, resolve_check, setup.*, world.*, npc.generate, character.recall, encounter.*, combat.*, roll_death_save, roll_death_event, rest.short, rest.long.".to_string(),
+            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 10 adds inventory (create/pickup/drop/equip/unequip/get/inspect/transfer) with encumbrance enforcement (pickup refused above overloaded threshold, 'encumbered' condition applied between encumbered and overloaded thresholds) and barter.exchange (persuasion-check-driven rate). Live tools: server.info, content.introspect, dice.roll, character.*, apply_effect, dispel_effect, proficiency.*, resource.*, condition.*, resolve_check, setup.*, world.*, npc.generate, character.recall, encounter.*, combat.*, roll_death_save, roll_death_event, rest.short, rest.long, inventory.*, barter.exchange.".to_string(),
         );
         info
     }

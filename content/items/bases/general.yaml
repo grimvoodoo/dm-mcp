@@ -1,0 +1,31 @@
+# General / non-weapon base kinds. Gold (currency is just an item), stone, and a heavy
+# crate useful for encumbrance tests — original entries, not SRD-derived.
+
+general:
+  gold:
+    name: "Gold piece"
+    description: "A standard coin. Currency is just an item — transfer, theft, and barter all go through the same code paths as any other row."
+    weight_lb: 0.02
+    base_value_gp: 1
+    stackable: true
+
+  stone:
+    name: "Heavy stone"
+    description: "A smooth, fist-sized stone — exactly ten pounds of nothing particularly useful. Content uses it as a convenient encumbrance-test weight."
+    weight_lb: 10
+    base_value_gp: 0
+    stackable: false
+
+  heavy_crate:
+    name: "Heavy crate"
+    description: "A rope-handled crate of coarse goods — a full hundred pounds of awkward cargo. Carrying one alone will slow anyone down."
+    weight_lb: 100
+    base_value_gp: 5
+    stackable: false
+
+  bread:
+    name: "Loaf of bread"
+    description: "Fresh-baked. Keeps a few days."
+    weight_lb: 0.5
+    base_value_gp: 1
+    stackable: true

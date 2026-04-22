@@ -1,0 +1,13 @@
+# Encumbrance thresholds.
+#
+# Weight is computed, never stored. Capacity = STR × capacity_per_str. The `encumbered`
+# condition is applied when the carried weight crosses `encumbered_threshold_pct`; pickups
+# are refused once carried weight would exceed `overloaded_threshold_pct` of capacity.
+#
+# Percentages use integer math ((weight * 100) / capacity), so a carry of 100 lb on a
+# 150 lb capacity is 66% — below the 67% threshold — matching the Roadmap Phase 10 E2E.
+
+encumbrance:
+  capacity_per_str: 15
+  encumbered_threshold_pct: 67
+  overloaded_threshold_pct: 100

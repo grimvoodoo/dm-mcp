@@ -92,6 +92,18 @@ struct DeathEventsFile {
     death_events: Vec<DeathEvent>,
 }
 
+/// One file under `content/items/bases/` — e.g. `weapons.yaml` has top-level key `weapons`,
+/// `general.yaml` has top-level key `general`. The `Content` loader unions the single
+/// top-level map from every file into `Content.item_bases`, letting authors group bases
+/// into separate YAMLs without a manual list.
+#[derive(Debug, Deserialize)]
+struct ItemBasesFile(BTreeMap<String, BTreeMap<String, BaseItem>>);
+
+#[derive(Debug, Deserialize)]
+struct EncumbranceFile {
+    encumbrance: EncumbranceRules,
+}
+
 // ── Public content types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +211,38 @@ pub struct DeathEvent {
     pub requires: Vec<String>,
 }
 
+/// Typed view of an item base. Only the fields Phase 10 needs are first-class — other
+/// fields carried on the YAML (damage, damage_type, properties, slot) are preserved in
+/// `extra` via flatten, so authors can add richer bases without code churn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseItem {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Weight in pounds. Required for encumbrance math; content-authoring convention is
+    /// that every base carries one (even non-physical items can set 0).
+    #[serde(default)]
+    pub weight_lb: f64,
+    #[serde(default)]
+    pub base_value_gp: f64,
+    #[serde(default)]
+    pub stackable: bool,
+    #[serde(default)]
+    pub slot: Option<String>,
+    #[serde(default)]
+    pub properties: Vec<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncumbranceRules {
+    pub capacity_per_str: i32,
+    pub encumbered_threshold_pct: i32,
+    pub overloaded_threshold_pct: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupQuestion {
     pub id: String,
@@ -227,6 +271,8 @@ pub struct Content {
     pub name_pools: BTreeMap<String, NamePool>,
     pub setup_questions: Vec<SetupQuestion>,
     pub death_events: Vec<DeathEvent>,
+    pub item_bases: BTreeMap<String, BaseItem>,
+    pub encumbrance: EncumbranceRules,
 }
 
 /// Source of a single YAML file's bytes. Hides the difference between embedded (`&'static
@@ -265,6 +311,32 @@ impl Content {
         let setup_questions: SetupQuestionsFile =
             parse(&get(override_dir, "campaign/setup_questions.yaml")?)?;
         let death_events: DeathEventsFile = parse(&get(override_dir, "rules/death_events.yaml")?)?;
+        let encumbrance: EncumbranceFile = parse(&get(override_dir, "rules/encumbrance.yaml")?)?;
+
+        // Item bases: every file under items/bases/ contributes to a flat base_kind →
+        // BaseItem map. Each file has a single top-level grouping key (e.g. `weapons:` or
+        // `general:`) that exists for author semantics only — the inner map is what we
+        // keep.
+        let mut item_bases: BTreeMap<String, BaseItem> = BTreeMap::new();
+        let base_files = list_yaml_files_under(override_dir, "items/bases")?;
+        for src in &base_files {
+            let wrapper: ItemBasesFile = parse(src)?;
+            for (_category, entries) in wrapper.0 {
+                for (base_kind, base) in entries {
+                    // Reject duplicate base_kind across files — on disk `read_dir` order
+                    // is unspecified, so silent-overwrite would produce nondeterministic
+                    // weights/values for inventory and barter.
+                    if item_bases.contains_key(&base_kind) {
+                        anyhow::bail!(
+                            "duplicate item base_kind {:?} across items/bases/*.yaml (in {})",
+                            base_kind,
+                            src.label()
+                        );
+                    }
+                    item_bases.insert(base_kind, base);
+                }
+            }
+        }
 
         // Archetypes: discover every *.yaml / *.yml under npcs/archetypes/ in whichever
         // source we're using. Embedded and on-disk use the same iteration logic so a new
@@ -296,6 +368,8 @@ impl Content {
             name_pools,
             setup_questions.questions,
             death_events.death_events,
+            item_bases,
+            encumbrance.encumbrance,
         )
     }
 
@@ -312,6 +386,8 @@ impl Content {
         name_pools: BTreeMap<String, NamePool>,
         setup_questions: Vec<SetupQuestion>,
         death_events: Vec<DeathEvent>,
+        item_bases: BTreeMap<String, BaseItem>,
+        encumbrance: EncumbranceRules,
     ) -> Result<Self> {
         let content = Self {
             abilities,
@@ -325,6 +401,8 @@ impl Content {
             name_pools,
             setup_questions,
             death_events,
+            item_bases,
+            encumbrance,
         };
         content.validate()?;
         Ok(content)
@@ -345,6 +423,53 @@ impl Content {
                 );
             }
         }
+
+        // Item bases: weight_lb and base_value_gp must be non-negative. A missing/typoed
+        // field silently defaults to 0.0 via serde, which would break encumbrance and
+        // barter math — catch the bad YAML here so startup fails with a clear message.
+        for (kind, base) in &self.item_bases {
+            if base.weight_lb.is_nan() || base.weight_lb < 0.0 {
+                anyhow::bail!(
+                    "item base {kind:?} has invalid weight_lb = {} (must be ≥ 0)",
+                    base.weight_lb
+                );
+            }
+            if base.base_value_gp.is_nan() || base.base_value_gp < 0.0 {
+                anyhow::bail!(
+                    "item base {kind:?} has invalid base_value_gp = {} (must be ≥ 0)",
+                    base.base_value_gp
+                );
+            }
+        }
+
+        // Encumbrance: capacity > 0, both thresholds in 1..=100, encumbered ≤ overloaded.
+        let er = &self.encumbrance;
+        if er.capacity_per_str <= 0 {
+            anyhow::bail!(
+                "encumbrance.capacity_per_str must be > 0 (got {})",
+                er.capacity_per_str
+            );
+        }
+        if !(1..=100).contains(&er.encumbered_threshold_pct) {
+            anyhow::bail!(
+                "encumbrance.encumbered_threshold_pct must be in 1..=100 (got {})",
+                er.encumbered_threshold_pct
+            );
+        }
+        if !(1..=100).contains(&er.overloaded_threshold_pct) {
+            anyhow::bail!(
+                "encumbrance.overloaded_threshold_pct must be in 1..=100 (got {})",
+                er.overloaded_threshold_pct
+            );
+        }
+        if er.encumbered_threshold_pct > er.overloaded_threshold_pct {
+            anyhow::bail!(
+                "encumbrance.encumbered_threshold_pct ({}) must be ≤ overloaded_threshold_pct ({})",
+                er.encumbered_threshold_pct,
+                er.overloaded_threshold_pct
+            );
+        }
+
         Ok(())
     }
 
@@ -363,6 +488,7 @@ impl Content {
             name_pools: self.name_pools.keys().cloned().collect(),
             setup_questions: self.setup_questions.iter().map(|q| q.id.clone()).collect(),
             death_events: self.death_events.iter().map(|d| d.kind.clone()).collect(),
+            item_bases: self.item_bases.keys().cloned().collect(),
         }
     }
 }
@@ -462,6 +588,7 @@ pub struct Introspection {
     pub name_pools: Vec<String>,
     pub setup_questions: Vec<String>,
     pub death_events: Vec<String>,
+    pub item_bases: Vec<String>,
 }
 
 // ── Source lookup ─────────────────────────────────────────────────────────────
@@ -609,6 +736,12 @@ mod tests {
             name_pools: BTreeMap::new(),
             setup_questions: vec![],
             death_events: vec![],
+            item_bases: BTreeMap::new(),
+            encumbrance: EncumbranceRules {
+                capacity_per_str: 15,
+                encumbered_threshold_pct: 67,
+                overloaded_threshold_pct: 100,
+            },
         };
         let err = content
             .validate()
