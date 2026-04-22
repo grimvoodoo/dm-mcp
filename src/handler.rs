@@ -30,6 +30,7 @@ use crate::setup::{
     self, AnswerParams as SetupAnswerParams, GenerateWorldParams, MarkReadyParams,
     NewCampaignParams,
 };
+use crate::world::{self, DescribeZoneParams, MapParams, TravelParams};
 
 /// Arguments for the `dice.roll` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -440,6 +441,41 @@ impl DmMcpHandler {
         Parameters(params): Parameters<MarkReadyParams>,
     ) -> Result<CallToolResult, McpError> {
         with_db_mut(&self.db, |conn| setup::mark_ready(conn, params))
+    }
+
+    // ── World (Phase 7) ───────────────────────────────────────────────────────
+
+    #[tool(
+        name = "world.travel",
+        description = "Move a character along an existing zone connection. Advances campaign_hour by the connection's travel_time_hours, updates current_zone_id, upserts character_zone_knowledge to 'visited', stub-generates the destination's missing neighbours on first contact, full-generates landmarks on first visit, and emits location.move."
+    )]
+    async fn world_travel(
+        &self,
+        Parameters(params): Parameters<TravelParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| world::travel(conn, params))
+    }
+
+    #[tool(
+        name = "world.map",
+        description = "Return a fog-filtered map rooted at the character's current zone. Walks zone_connections BFS from the origin assigning 2D positions from direction_from. Includes only zones the character has at least 'rumored' knowledge of."
+    )]
+    async fn world_map(
+        &self,
+        Parameters(params): Parameters<MapParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db(&self.db, |conn| world::map(conn, params))
+    }
+
+    #[tool(
+        name = "world.describe_zone",
+        description = "Detailed readout of a single zone (name, biome, kind, description, landmarks, outgoing connections), gated by the character's knowledge level. Refuses zones the character has no rumored-or-better knowledge of."
+    )]
+    async fn world_describe_zone(
+        &self,
+        Parameters(params): Parameters<DescribeZoneParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db(&self.db, |conn| world::describe_zone(conn, params))
     }
 }
 

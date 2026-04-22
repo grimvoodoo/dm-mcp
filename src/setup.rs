@@ -330,6 +330,27 @@ pub fn mark_ready(conn: &mut Connection, p: MarkReadyParams) -> Result<MarkReady
     }
     let started_at = wall_clock_millis();
 
+    // If the caller passes a player character, look up where they're standing so we can
+    // mark their starting zone as visited. The player obviously knows where their own
+    // character is — pre-seeding the knowledge here means the very first world.map call
+    // sees the starting zone without an extra setup step.
+    let player_starting_zone: Option<i64> = match p.player_character_id {
+        None => None,
+        Some(pcid) => {
+            // current_zone_id is itself an Option<i64> in the row, so we get
+            // Result<Option<i64>> from query_row.
+            match conn.query_row(
+                "SELECT current_zone_id FROM characters WHERE id = ?1",
+                [pcid],
+                |row| row.get::<_, Option<i64>>(0),
+            ) {
+                Ok(zid) => zid,
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e).context("read player character's current_zone_id"),
+            }
+        }
+    };
+
     let participants: Vec<crate::events::Participant<'_>> = match p.player_character_id {
         Some(pcid) => vec![crate::events::Participant {
             character_id: pcid,
@@ -349,6 +370,17 @@ pub fn mark_ready(conn: &mut Connection, p: MarkReadyParams) -> Result<MarkReady
         params![started_at, p.player_character_id],
     )
     .context("flip campaign_state to running")?;
+
+    // Pre-seed the player's knowledge of their starting zone.
+    if let (Some(pcid), Some(zid)) = (p.player_character_id, player_starting_zone) {
+        tx.execute(
+            "INSERT INTO character_zone_knowledge (character_id, zone_id, level, last_visit_at_hour)
+             VALUES (?1, ?2, 'visited', 0)
+             ON CONFLICT(character_id, zone_id) DO UPDATE SET level = 'visited'",
+            params![pcid, zid],
+        )
+        .context("seed player knowledge of starting zone")?;
+    }
 
     let emitted = events::emit_in_tx(
         &tx,
