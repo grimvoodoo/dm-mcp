@@ -245,10 +245,18 @@ _service-start: _sweep-stale
 _service-stop: _sweep-stale
 	@if [ -f "$(PID_DIR)/dm-mcp.pid" ]; then \
 		pid=$$(cat "$(PID_DIR)/dm-mcp.pid"); \
-		if kill -0 "$$pid" 2>/dev/null; then \
-			kill "$$pid" && echo "✓ Stopped dm-mcp (pid: $$pid)"; \
+		if [ -z "$$pid" ] || ! kill -0 "$$pid" 2>/dev/null; then \
+			rm -f "$(PID_DIR)/dm-mcp.pid"; \
+		else \
+			comm=$$(cat "/proc/$$pid/comm" 2>/dev/null || true); \
+			cwd=$$(readlink "/proc/$$pid/cwd" 2>/dev/null || true); \
+			if [ "$$comm" = "dm-mcp" ] && [ "$$cwd" = "$(CURDIR)" ]; then \
+				kill "$$pid" && echo "✓ Stopped dm-mcp (pid: $$pid)"; \
+			else \
+				echo "⚠ pid $$pid is not this checkout's dm-mcp (comm=$$comm cwd=$$cwd); not killing"; \
+			fi; \
+			rm -f "$(PID_DIR)/dm-mcp.pid"; \
 		fi; \
-		rm -f "$(PID_DIR)/dm-mcp.pid"; \
 	fi
 
 # Catch-all: kill any dm-mcp binary from THIS checkout left behind by an earlier
