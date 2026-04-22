@@ -21,6 +21,7 @@ mod dice;
 mod effects;
 mod events;
 mod handler;
+mod npcs;
 mod proficiencies;
 mod setup;
 mod transport;

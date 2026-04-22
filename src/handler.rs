@@ -22,6 +22,7 @@ use crate::content::Content as ContentCatalog;
 use crate::db::DbHandle;
 use crate::dice;
 use crate::effects::{self, ApplyParams as EffectApplyParams, DispelParams};
+use crate::npcs::{self, GenerateParams as NpcGenerateParams, RecallParams as NpcRecallParams};
 use crate::proficiencies::{
     self, AdjustResourceParams, RemoveProficiencyParams, RemoveResourceParams,
     SetProficiencyParams, SetResourceParams,
@@ -477,6 +478,41 @@ impl DmMcpHandler {
     ) -> Result<CallToolResult, McpError> {
         with_db(&self.db, |conn| world::describe_zone(conn, params))
     }
+
+    // ── NPCs (Phase 8) ────────────────────────────────────────────────────────
+
+    #[tool(
+        name = "npc.generate",
+        description = "Create an NPC from a bundled archetype. Rolls stats within the archetype's ranges, derives HP from its formula, picks a name from the species name pool, inserts proficiencies, rolls the loadout (creating held items), and synthesizes 3-5 history.backstory events at negative campaign_hour. Single transaction."
+    )]
+    async fn npc_generate(
+        &self,
+        Parameters(params): Parameters<NpcGenerateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            npcs::generate(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "character.recall",
+        description = "Return events this character participated in (as actor, target, witness, or beneficiary), newest-first. Optional filters: zone_id, other_character_id (co-participation), other_item_id (event references that item), kind_prefix (e.g. 'history.' for backstory only), since_hour (inclusive lower bound; use negative values to include pre-campaign backstory), limit (default 50, max 500)."
+    )]
+    async fn character_recall(
+        &self,
+        Parameters(params): Parameters<NpcRecallParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db(&self.db, |conn| npcs::recall(conn, params))
+    }
 }
 
 #[tool_handler]
@@ -491,7 +527,7 @@ impl ServerHandler for DmMcpHandler {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 4 adds character CRUD with effective-stat composition, effects apply/dispel, proficiencies CRUD, resources CRUD. Live tools: server.info, content.introspect, dice.roll, character.create, character.get, character.update_plans, character.change_role, apply_effect, dispel_effect, proficiency.set, proficiency.remove, resource.set, resource.adjust, resource.remove.".to_string(),
+            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 8 adds npc.generate (archetype-driven NPC creation with rolled stats, loadout, and synthesized backstory) and character.recall (event-log lookup with filters). Live tools: server.info, content.introspect, dice.roll, character.create, character.get, character.update_plans, character.change_role, character.recall, apply_effect, dispel_effect, proficiency.set, proficiency.remove, resource.set, resource.adjust, resource.remove, condition.apply, condition.remove, resolve_check, setup.new_campaign, setup.answer, setup.generate_world, setup.mark_ready, world.travel, world.map, world.describe_zone, npc.generate.".to_string(),
         );
         info
     }
