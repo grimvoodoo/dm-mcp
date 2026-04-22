@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::HttpConfig;
 use crate::content::Content;
+use crate::db::DbHandle;
 use crate::handler::{DmMcpHandler, Transport};
 
 #[derive(Clone)]
@@ -30,18 +31,25 @@ struct HealthState;
 ///
 /// Completes when a shutdown signal is received (SIGINT / SIGTERM) and all in-flight
 /// requests drain.
-pub async fn run(cfg: &HttpConfig, content: Arc<Content>) -> Result<()> {
+pub async fn run(cfg: &HttpConfig, content: Arc<Content>, db: DbHandle) -> Result<()> {
     let addr = cfg.socket_addr();
     tracing::info!(bind = %addr, "dm-mcp: serving MCP over HTTP");
 
     let cancel = CancellationToken::new();
 
     // Factory: each new MCP session gets its own handler instance, sharing the same
-    // content catalog via Arc clone.
+    // content catalog and DB handle via Arc clone.
     let mcp_service = StreamableHttpService::new(
         {
             let content = Arc::clone(&content);
-            move || Ok(DmMcpHandler::new(Transport::Http, Arc::clone(&content)))
+            let db = Arc::clone(&db);
+            move || {
+                Ok(DmMcpHandler::new(
+                    Transport::Http,
+                    Arc::clone(&content),
+                    Arc::clone(&db),
+                ))
+            }
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token()),

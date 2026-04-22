@@ -11,16 +11,19 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
+mod characters;
 mod config;
 mod content;
 mod db;
 mod dice;
+mod effects;
+mod events;
 mod handler;
+mod proficiencies;
 mod transport;
 
 use crate::config::Config;
 use crate::content::Content;
-use crate::db::Database;
 
 /// dm-mcp — MCP toolkit for AI Dungeon Masters running solo d20-inspired RPG campaigns.
 #[derive(Parser, Debug)]
@@ -64,16 +67,14 @@ async fn main() -> Result<()> {
         "dm-mcp: content catalog loaded"
     );
 
-    // Open the campaign database — applies PRAGMAs and runs migrations. The handle is held
-    // here for the process lifetime; Phase 2 doesn't yet expose tools that query it, but
-    // opening at startup satisfies the Phase 2 E2E assertion (fresh DB on first run with
-    // every expected table present) and catches config / permission problems up front.
-    let _db = Database::open(&cfg.db)?;
+    // Open the campaign database — applies PRAGMAs and runs migrations. The handle is
+    // shared across MCP sessions so tools can read/write the single campaign connection.
+    let db = db::open(&cfg.db)?;
     tracing::info!(path = %cfg.db.path.display(), "dm-mcp: campaign database opened");
 
     match cli.transport {
-        TransportCmd::Stdio => transport::stdio::run(content).await,
-        TransportCmd::Http => transport::http::run(&cfg.http, content).await,
+        TransportCmd::Stdio => transport::stdio::run(content, db).await,
+        TransportCmd::Http => transport::http::run(&cfg.http, content, db).await,
     }
 }
 

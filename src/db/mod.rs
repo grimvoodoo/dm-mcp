@@ -1,10 +1,13 @@
 //! Campaign database: SQLite connection opener (PRAGMAs applied per docs/architecture.md)
 //! and schema migration.
 //!
-//! The MCP runs one campaign per process, so there's one DB connection for the process
-//! lifetime. Callers obtain a `Database` handle at startup and share it via `Arc`.
+//! The MCP runs one campaign per process, so there's one SQLite connection for the process
+//! lifetime. Callers share it via `Arc<Mutex<Connection>>` through the [`DbHandle`] alias —
+//! good enough for single-campaign-per-process, and simple enough that we don't need a
+//! pool. Later phases may add a queue or specialised writer task if contention shows up.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -13,28 +16,16 @@ use crate::config::DbConfig;
 
 pub mod schema;
 
-/// Wrapper around a single SQLite connection. Phase 2 holds the connection directly; when
-/// we need concurrent access we'll add a mutex or switch to a pool.
-pub struct Database {
-    connection: Connection,
-}
+/// Shared handle on the campaign DB connection. Cheap to clone — Arc bump.
+pub type DbHandle = Arc<Mutex<Connection>>;
 
-impl Database {
-    /// Open the campaign database at `cfg.path`, apply every PRAGMA from `cfg`, and run
-    /// migrations. Creates the file if it doesn't exist.
-    pub fn open(cfg: &DbConfig) -> Result<Self> {
-        let conn = open_connection(&cfg.path, cfg)
-            .with_context(|| format!("failed to open SQLite DB at {}", cfg.path.display()))?;
-        let mut db = Self { connection: conn };
-        schema::migrate(&mut db.connection).context("apply schema migrations")?;
-        Ok(db)
-    }
-
-    /// Borrow the underlying connection.
-    #[allow(dead_code)] // consumed by tools in Phase 3+
-    pub fn conn(&self) -> &Connection {
-        &self.connection
-    }
+/// Open the campaign database at `cfg.path`, apply every PRAGMA from `cfg`, run migrations,
+/// and return a shared handle. Creates the file if it doesn't exist.
+pub fn open(cfg: &DbConfig) -> Result<DbHandle> {
+    let mut conn = open_connection(&cfg.path, cfg)
+        .with_context(|| format!("failed to open SQLite DB at {}", cfg.path.display()))?;
+    schema::migrate(&mut conn).context("apply schema migrations")?;
+    Ok(Arc::new(Mutex::new(conn)))
 }
 
 fn open_connection(path: &Path, cfg: &DbConfig) -> Result<Connection> {
@@ -86,7 +77,7 @@ mod tests {
         let db_path = tmp.path().join("test.db");
         assert!(!db_path.exists(), "db file should not exist yet");
 
-        let _db = Database::open(&test_cfg(db_path.clone())).expect("open");
+        let _db = open(&test_cfg(db_path.clone())).expect("open");
         assert!(db_path.exists(), "db file should be created on open");
     }
 
@@ -95,9 +86,9 @@ mod tests {
         let tmp = TempDir::new().expect("tmpdir");
         let db_path = tmp.path().join("reopen.db");
         {
-            let _first = Database::open(&test_cfg(db_path.clone())).expect("first open");
+            let _first = open(&test_cfg(db_path.clone())).expect("first open");
         }
-        let _second = Database::open(&test_cfg(db_path.clone())).expect("second open");
+        let _second = open(&test_cfg(db_path.clone())).expect("second open");
         assert!(db_path.exists());
     }
 
@@ -105,16 +96,15 @@ mod tests {
     fn pragmas_are_applied() {
         let tmp = TempDir::new().expect("tmpdir");
         let db_path = tmp.path().join("pragma.db");
-        let db = Database::open(&test_cfg(db_path)).expect("open");
+        let db = open(&test_cfg(db_path)).expect("open");
+        let conn = db.lock().unwrap();
 
-        let journal: String = db
-            .conn()
+        let journal: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(journal.to_ascii_uppercase(), "WAL");
 
-        let fk: i64 = db
-            .conn()
+        let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
