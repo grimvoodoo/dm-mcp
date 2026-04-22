@@ -11,7 +11,7 @@
 //! Backstory synthesis in Phase 8 will emit events with negative `campaign_hour`.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -53,10 +53,11 @@ pub struct EmittedEvent {
     pub event_id: i64,
 }
 
-/// Insert an event plus its junction rows inside one transaction. Returns the new event id.
-pub fn emit(conn: &mut Connection, spec: &EventSpec<'_>) -> Result<EmittedEvent> {
-    let tx = conn.transaction().context("begin event tx")?;
-
+/// Insert an event plus its junction rows inside an existing transaction. Use this when
+/// the calling tool needs to bundle DB writes plus the event into a single atomic unit
+/// (e.g. setup::generate_world creating zones + emitting world.generated). The caller owns
+/// the transaction and must commit it.
+pub fn emit_in_tx(tx: &Transaction<'_>, spec: &EventSpec<'_>) -> Result<EmittedEvent> {
     let payload = serde_json::to_string(&spec.payload).context("serialize payload")?;
 
     tx.execute(
@@ -103,8 +104,16 @@ pub fn emit(conn: &mut Connection, spec: &EventSpec<'_>) -> Result<EmittedEvent>
         })?;
     }
 
-    tx.commit().context("commit event tx")?;
     Ok(EmittedEvent { event_id })
+}
+
+/// Insert an event plus its junction rows inside its own transaction. The standalone
+/// version used when the caller doesn't need atomicity beyond the event itself.
+pub fn emit(conn: &mut Connection, spec: &EventSpec<'_>) -> Result<EmittedEvent> {
+    let tx = conn.transaction().context("begin event tx")?;
+    let result = emit_in_tx(&tx, spec)?;
+    tx.commit().context("commit event tx")?;
+    Ok(result)
 }
 
 #[cfg(test)]

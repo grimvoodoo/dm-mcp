@@ -1,0 +1,25 @@
+# Bootstrap dialogue the DM agent walks the player through at campaign start.
+# See docs/campaign-setup.md for the full design.
+#
+# Phase 6 ships a minimal but representative set: biome (drives the starting zone),
+# enemy preference (multi-select; later phases will use this to bias encounter pools),
+# tone (single-choice influencing prose generation). Later phases will extend.
+
+questions:
+  - id: starting_biome
+    prompt: "What kind of land does the adventure begin in?"
+    options: [temperate_forest]
+    or_free_text: true
+    multi: false
+
+  - id: enemy_preference
+    prompt: "What kinds of threats should feature most? (you can pick more than one)"
+    options: [humanoid_raiders, undead, beasts, outsiders, political_intrigue, cults]
+    or_free_text: true
+    multi: true
+
+  - id: tone
+    prompt: "Grim and gritty, balanced, or swashbuckling heroic?"
+    options: [grim, balanced, heroic]
+    or_free_text: false
+    multi: false
