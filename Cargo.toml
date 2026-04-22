@@ -15,6 +15,7 @@ anyhow = "1.0.102"
 axum = "0.8.9"
 clap = { version = "4.6.1", features = ["derive"] }
 include_dir = "0.7.4"
+rand = "0.10.1"
 rmcp = { version = "1.5.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 schemars = "1.2.1"
