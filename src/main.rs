@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
+mod barter;
 mod characters;
 mod checks;
 mod combat;
@@ -23,6 +24,7 @@ mod effects;
 mod encounters;
 mod events;
 mod handler;
+mod inventory;
 mod npcs;
 mod proficiencies;
 mod rests;

@@ -8,3 +8,6 @@
 /campaign.db
 /campaign.db-wal
 /campaign.db-shm
+
+# Claude Code runtime state (scheduled tasks, session locks)
+/.claude/
