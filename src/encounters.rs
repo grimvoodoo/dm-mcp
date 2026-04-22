@@ -203,7 +203,7 @@ pub fn complete(conn: &mut Connection, p: CompleteParams) -> Result<CompleteResu
     }
 
     let modifier = p.xp_modifier.unwrap_or(1.0).clamp(0.0, 2.0);
-    let xp_total = ((row.xp_budget as f64) * modifier).round() as i32;
+    let xp_budget_scaled = ((row.xp_budget as f64) * modifier).round() as i32;
     let player_side: Vec<i64> = conn
         .prepare(
             "SELECT character_id FROM encounter_participants
@@ -214,8 +214,13 @@ pub fn complete(conn: &mut Connection, p: CompleteParams) -> Result<CompleteResu
     let per_share = if player_side.is_empty() {
         0
     } else {
-        xp_total / player_side.len() as i32
+        xp_budget_scaled / player_side.len() as i32
     };
+    // Report what was actually credited. Integer division can leave up to
+    // `player_side.len() - 1` XP unawarded for budgets that don't divide evenly; keeping
+    // `xp_awarded_total = per_share * n` means the response and event payload agree with
+    // the sum of per_player_xp entries rather than overstating by the truncated remainder.
+    let xp_total = per_share * player_side.len() as i32;
 
     let hours_elapsed = p.hours_elapsed.unwrap_or(row.estimated_duration_hours);
     let now = crate::world::current_campaign_hour(conn)? + hours_elapsed.max(0) as i64;
@@ -269,6 +274,7 @@ pub fn complete(conn: &mut Connection, p: CompleteParams) -> Result<CompleteResu
                 "path": p.path,
                 "xp_modifier": modifier,
                 "xp_budget": row.xp_budget,
+                "xp_budget_scaled": xp_budget_scaled,
                 "xp_total": xp_total,
                 "per_player_xp": awards,
                 "hours_elapsed": hours_elapsed,
@@ -547,6 +553,58 @@ mod tests {
         )
         .expect_err("completing abandoned encounter should fail");
         assert!(format!("{err:#}").contains("not active"));
+    }
+
+    #[test]
+    fn complete_reports_truthful_xp_total_under_integer_division() {
+        // xp_budget 200, 3 player_side → per_share = 66, total credited = 198 (not 200).
+        // The reported xp_awarded_total must match the sum of per_player_xp (regression
+        // guard for CodeRabbit review on PR #12).
+        let mut conn = fresh();
+        let a = make_char(&mut conn, "A", "player");
+        let b = make_char(&mut conn, "B", "companion");
+        let c = make_char(&mut conn, "C", "companion");
+        let enc = create(
+            &mut conn,
+            CreateParams {
+                zone_id: None,
+                name: None,
+                goal: "g".into(),
+                estimated_duration_hours: Some(1),
+                xp_budget: 200,
+                participants: vec![
+                    CreateParticipant {
+                        character_id: a,
+                        side: "player_side".into(),
+                    },
+                    CreateParticipant {
+                        character_id: b,
+                        side: "player_side".into(),
+                    },
+                    CreateParticipant {
+                        character_id: c,
+                        side: "player_side".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let r = complete(
+            &mut conn,
+            CompleteParams {
+                encounter_id: enc.encounter_id,
+                path: "combat_victory".into(),
+                xp_modifier: None,
+                hours_elapsed: None,
+            },
+        )
+        .unwrap();
+        let per_player_sum: i32 = r.per_player_xp.iter().map(|a| a.xp).sum();
+        assert_eq!(
+            r.xp_awarded_total, per_player_sum,
+            "xp_awarded_total must equal the sum of per_player_xp"
+        );
+        assert_eq!(r.xp_awarded_total, 198);
     }
 
     #[test]

@@ -295,6 +295,10 @@ pub fn next_turn(conn: &mut Connection, p: NextTurnParams) -> Result<NextTurnRes
     }
     let n = ordered.len() as i32;
 
+    // Clamp a stale turn_index — a participant added/removed between turns could leave
+    // the stored index outside the current initiative list, and `ordered[...]` would
+    // panic the server thread. Treat out-of-range as "start of next round".
+    let current_turn = current_turn.clamp(0, n - 1);
     let next_turn_idx = current_turn + 1;
     let (new_turn, new_round, wrapped) = if next_turn_idx >= n {
         (0, current_round + 1, true)
@@ -896,7 +900,9 @@ pub fn roll_death_save(conn: &mut Connection, p: DeathSaveParams) -> Result<Deat
     )
     .context("update death save counters")?;
 
-    // If we just stabilised, clear the mortally_wounded condition.
+    // If we just stabilised, clear the mortally_wounded condition and emit the matching
+    // condition.expired event so consumers tailing the event stream see the transition
+    // (apply_healing emits the same event on its equivalent path).
     if new_status == "alive" {
         if let Some(mw_id) = tx
             .query_row(
@@ -911,6 +917,32 @@ pub fn roll_death_save(conn: &mut Connection, p: DeathSaveParams) -> Result<Deat
             tx.execute(
                 "UPDATE character_conditions SET active = 0 WHERE id = ?1",
                 [mw_id],
+            )?;
+            events::emit_in_tx(
+                &tx,
+                &EventSpec {
+                    kind: "condition.expired",
+                    campaign_hour: now,
+                    combat_round: None,
+                    zone_id: None,
+                    encounter_id: None,
+                    parent_id: None,
+                    summary: format!(
+                        "Character id={} stabilised: mortally_wounded cleared ({outcome})",
+                        p.character_id
+                    ),
+                    payload: serde_json::json!({
+                        "condition_id": mw_id,
+                        "condition": "mortally_wounded",
+                        "reason": "stabilised",
+                        "outcome": outcome,
+                    }),
+                    participants: &[Participant {
+                        character_id: p.character_id,
+                        role: "target",
+                    }],
+                    items: &[],
+                },
             )?;
         }
     }

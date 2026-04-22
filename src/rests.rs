@@ -8,6 +8,7 @@
 //!   alive (a rest doesn't apply to a dead or unconscious character's save tally).
 
 use anyhow::{bail, Context, Result};
+use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
@@ -116,14 +117,25 @@ fn do_rest(
         });
     }
 
+    // Long rest from unconscious is a legitimate state transition — a stabilised,
+    // rested character wakes up. Without this we'd end up at full HP with
+    // status='unconscious' and mortally_wounded still active, which breaks the death
+    // state machine (nothing would bring them back to 'alive').
+    let transitions_to_alive = restore_hp && status == "unconscious";
+    let new_status = if transitions_to_alive {
+        "alive".to_string()
+    } else {
+        status.clone()
+    };
+
     let hp_restored = if restore_hp && hp_current < hp_max {
         tx.execute(
             "UPDATE characters
-             SET hp_current = hp_max,
+             SET hp_current = hp_max, status = ?1,
                  death_save_successes = 0, death_save_failures = 0,
-                 updated_at = ?1
-             WHERE id = ?2",
-            params![now, character_id],
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![new_status, now, character_id],
         )
         .context("restore hp")?;
         Some(hp_max - hp_current)
@@ -131,10 +143,11 @@ fn do_rest(
         // Still clear death-save counters on long rest even if at full HP already.
         tx.execute(
             "UPDATE characters
-             SET death_save_successes = 0, death_save_failures = 0,
-                 updated_at = ?1
-             WHERE id = ?2",
-            params![now, character_id],
+             SET status = ?1,
+                 death_save_successes = 0, death_save_failures = 0,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![new_status, now, character_id],
         )
         .context("reset death save counters")?;
         None
@@ -142,7 +155,52 @@ fn do_rest(
         None
     };
 
-    let new_status = status.clone();
+    // If a long rest wakes an unconscious character, clear mortally_wounded and emit
+    // condition.expired so event tailers see the transition — matches apply_healing and
+    // the stabilise path in roll_death_save.
+    if transitions_to_alive {
+        if let Some(mw_id) = tx
+            .query_row(
+                "SELECT id FROM character_conditions
+                 WHERE character_id = ?1 AND condition = 'mortally_wounded' AND active = 1
+                 ORDER BY id DESC LIMIT 1",
+                [character_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("query active mortally_wounded")?
+        {
+            tx.execute(
+                "UPDATE character_conditions SET active = 0 WHERE id = ?1",
+                [mw_id],
+            )
+            .context("clear mortally_wounded on long rest wake")?;
+            events::emit_in_tx(
+                &tx,
+                &EventSpec {
+                    kind: "condition.expired",
+                    campaign_hour: now,
+                    combat_round: None,
+                    zone_id: None,
+                    encounter_id: None,
+                    parent_id: None,
+                    summary: format!(
+                        "Character id={character_id} woke from long rest: mortally_wounded cleared"
+                    ),
+                    payload: serde_json::json!({
+                        "condition_id": mw_id,
+                        "condition": "mortally_wounded",
+                        "reason": "long_rest_wake",
+                    }),
+                    participants: &[Participant {
+                        character_id,
+                        role: "target",
+                    }],
+                    items: &[],
+                },
+            )?;
+        }
+    }
     let emitted = events::emit_in_tx(
         &tx,
         &EventSpec {
@@ -276,6 +334,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(slot, 0);
+    }
+
+    #[test]
+    fn long_rest_wakes_unconscious_and_clears_mortally_wounded() {
+        use crate::combat::{self, ApplyDamageParams};
+        let mut conn = fresh();
+        let id = mk(&mut conn);
+        // Drop them to 0 HP → mortally_wounded + unconscious.
+        combat::apply_damage(
+            &mut conn,
+            ApplyDamageParams {
+                character_id: id,
+                amount: 100,
+                damage_type: None,
+                source: None,
+                encounter_id: None,
+            },
+        )
+        .unwrap();
+        // Pre-condition check.
+        let status: String = conn
+            .query_row("SELECT status FROM characters WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "unconscious");
+        let mw_active: i64 = conn
+            .query_row(
+                "SELECT active FROM character_conditions
+                 WHERE character_id = ?1 AND condition = 'mortally_wounded'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mw_active, 1);
+
+        // Long rest should wake them up and clear mortally_wounded.
+        let r = long_rest(&mut conn, LongRestParams { character_id: id }).unwrap();
+        assert_eq!(r.status_after, "alive");
+        let status: String = conn
+            .query_row("SELECT status FROM characters WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "alive");
+        let mw_active: i64 = conn
+            .query_row(
+                "SELECT active FROM character_conditions
+                 WHERE character_id = ?1 AND condition = 'mortally_wounded'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mw_active, 0);
     }
 
     #[test]
