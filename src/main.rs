@@ -24,6 +24,7 @@ mod handler;
 mod proficiencies;
 mod setup;
 mod transport;
+mod world;
 
 use crate::config::Config;
 use crate::content::Content;
