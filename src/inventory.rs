@@ -283,21 +283,32 @@ pub fn pickup(
 ) -> Result<std::result::Result<PickupResult, PickupRefused>> {
     // Read the item row + its zone location.
     let item = read_item(conn, p.item_id)?;
-    if item.zone_location_id.is_none() {
-        bail!(
+    let item_zone = item.zone_location_id.ok_or_else(|| {
+        anyhow::anyhow!(
             "item {} is not in a zone (holder={:?}, container={:?})",
             p.item_id,
             item.holder_character_id,
             item.container_item_id
-        );
-    }
-    let str_score: i32 = conn
+        )
+    })?;
+    let (str_score, current_zone_id): (i32, Option<i64>) = conn
         .query_row(
-            "SELECT str_score FROM characters WHERE id = ?1",
+            "SELECT str_score, current_zone_id FROM characters WHERE id = ?1",
             [p.character_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .with_context(|| format!("character {} not found", p.character_id))?;
+    // Co-location check: the picker must be in the same zone as the item. Otherwise any
+    // character could pick up any zone-located item anywhere on the map.
+    match current_zone_id {
+        Some(czid) if czid == item_zone => {}
+        other => bail!(
+            "cannot pick up item {} (in zone {item_zone}) from character {} (current zone {:?})",
+            p.item_id,
+            p.character_id,
+            other
+        ),
+    }
 
     let capacity = (str_score as f64) * (content.encumbrance.capacity_per_str as f64);
     let item_weight = effective_weight_for_item(&item, content);
@@ -305,9 +316,11 @@ pub fn pickup(
     let would_be = current_carried + item_weight;
     let would_pct = pct_of_capacity(would_be, capacity);
 
-    // "Above 100%" is strict per docs/items.md — a pickup that lands exactly at capacity
-    // is allowed. Anything past that is refused as would_overload.
-    if would_pct > content.encumbrance.overloaded_threshold_pct {
+    // Overload check uses raw weight, not the floored percentage — otherwise a pickup at
+    // 150.02 lb / 150 lb (100.01%) would floor to 100 and be accepted. The docs call this
+    // "above 100%"; strict on raw pounds is the truthful implementation.
+    let overloaded_limit = capacity * (content.encumbrance.overloaded_threshold_pct as f64) / 100.0;
+    if would_be > overloaded_limit {
         return Ok(Err(PickupRefused {
             error: "would_overload",
             character_id: p.character_id,
@@ -680,23 +693,31 @@ pub fn transfer(
     if count != 1 {
         bail!("exactly one destination must be set (got {count})");
     }
+    // Reject self-contained cycles — not caught by the DB schema, silently valid in SQL.
+    if p.to_container_item_id == Some(p.item_id) {
+        bail!("cannot transfer item {} into itself", p.item_id);
+    }
 
     let now = crate::world::current_campaign_hour(conn)?;
     let tx = conn.transaction().context("begin transfer tx")?;
-    tx.execute(
-        "UPDATE items
-         SET holder_character_id = ?1, container_item_id = ?2, zone_location_id = ?3,
-             equipped_slot = NULL, updated_at = ?4
-         WHERE id = ?5",
-        params![
-            p.to_character_id,
-            p.to_container_item_id,
-            p.to_zone_location_id,
-            now,
-            p.item_id,
-        ],
-    )
-    .context("transfer item")?;
+    let updated = tx
+        .execute(
+            "UPDATE items
+             SET holder_character_id = ?1, container_item_id = ?2, zone_location_id = ?3,
+                 equipped_slot = NULL, updated_at = ?4
+             WHERE id = ?5",
+            params![
+                p.to_character_id,
+                p.to_container_item_id,
+                p.to_zone_location_id,
+                now,
+                p.item_id,
+            ],
+        )
+        .context("transfer item")?;
+    if updated == 0 {
+        bail!("item {} does not exist", p.item_id);
+    }
 
     let emitted = events::emit_in_tx(
         &tx,

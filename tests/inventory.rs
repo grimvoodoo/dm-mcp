@@ -73,32 +73,34 @@ async fn make_char(
     name: &str,
     str_score: i64,
     cha: i64,
+    current_zone_id: Option<i64>,
 ) -> Result<i64> {
-    let r = call(
-        client,
-        "character.create",
-        serde_json::json!({
-            "name": name,
-            "role": "player",
-            "str_score": str_score,
-            "dex_score": 10,
-            "con_score": 10,
-            "int_score": 10,
-            "wis_score": 10,
-            "cha_score": cha,
-            "hp_max": 20,
-            "armor_class": 12
-        }),
-    )
-    .await?;
+    let mut body = serde_json::json!({
+        "name": name,
+        "role": "player",
+        "str_score": str_score,
+        "dex_score": 10,
+        "con_score": 10,
+        "int_score": 10,
+        "wis_score": 10,
+        "cha_score": cha,
+        "hp_max": 20,
+        "armor_class": 12
+    });
+    if let Some(z) = current_zone_id {
+        body["current_zone_id"] = serde_json::json!(z);
+    }
+    let r = call(client, "character.create", body).await?;
     Ok(r["character_id"].as_i64().unwrap())
 }
 
-async fn make_zone_and_place(
+/// Run setup → generate_world and return the starting zone id. Doesn't call mark_ready;
+/// tests that want to flip into the running phase can do so themselves after creating
+/// a player character with `current_zone_id` set to the returned id (pickup requires the
+/// character to be co-located with the item, so we need the zone before the character).
+async fn create_starting_zone(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    character_id: i64,
 ) -> Result<i64> {
-    // Use setup.new → answer → generate_world → mark_ready to get a starting zone.
     call(client, "setup.new_campaign", serde_json::json!({})).await?;
     call(
         client,
@@ -110,15 +112,7 @@ async fn make_zone_and_place(
     )
     .await?;
     let gen = call(client, "setup.generate_world", serde_json::json!({})).await?;
-    let zone_id = gen["starting_zone_id"].as_i64().unwrap();
-    call(
-        client,
-        "setup.mark_ready",
-        serde_json::json!({ "player_character_id": character_id }),
-    )
-    .await?;
-    // Update character's current_zone (mark_ready reads from characters row).
-    Ok(zone_id)
+    Ok(gen["starting_zone_id"].as_i64().unwrap())
 }
 
 // ── E2E 1: encumbrance ladder ───────────────────────────────────────────────
@@ -126,8 +120,16 @@ async fn make_zone_and_place(
 #[tokio::test]
 async fn encumbrance_ladder_matches_roadmap() -> Result<()> {
     let h = connect().await?;
-    let pc = make_char(&h.client, "Kira", 10, 10).await?; // capacity = 150 lb
-    let zone = make_zone_and_place(&h.client, pc).await?;
+    // Create the zone first so we can place the character in it at creation time —
+    // inventory.pickup now requires the character to be co-located with the item.
+    let zone = create_starting_zone(&h.client).await?;
+    let pc = make_char(&h.client, "Kira", 10, 10, Some(zone)).await?; // capacity = 150 lb
+    call(
+        &h.client,
+        "setup.mark_ready",
+        serde_json::json!({ "player_character_id": pc }),
+    )
+    .await?;
 
     // Drop 1 heavy_crate (100 lb), 1 stone (10 lb), and 5 more stones (50 lb) into the zone.
     let mut zone_items: Vec<i64> = Vec::new();
@@ -220,10 +222,17 @@ async fn encumbrance_ladder_matches_roadmap() -> Result<()> {
 #[tokio::test]
 async fn barter_forced_success_and_failure_paths() -> Result<()> {
     let h = connect().await?;
-    let pc = make_char(&h.client, "Kira", 10, 14).await?;
-    let merchant = make_char(&h.client, "Merchant", 10, 10).await?;
-    // Just to have a zone; barter doesn't need one but setup creates other state.
-    make_zone_and_place(&h.client, pc).await?;
+    // Barter doesn't need a zone, but we still set the campaign up so character.create
+    // works against a valid schema state.
+    let zone = create_starting_zone(&h.client).await?;
+    let pc = make_char(&h.client, "Kira", 10, 14, Some(zone)).await?;
+    let merchant = make_char(&h.client, "Merchant", 10, 10, Some(zone)).await?;
+    call(
+        &h.client,
+        "setup.mark_ready",
+        serde_json::json!({ "player_character_id": pc }),
+    )
+    .await?;
 
     // Give both sides items.
     let player_gold = call(
@@ -346,8 +355,14 @@ async fn barter_forced_success_and_failure_paths() -> Result<()> {
 #[tokio::test]
 async fn drop_clears_encumbered_via_mcp() -> Result<()> {
     let h = connect().await?;
-    let pc = make_char(&h.client, "Kira", 10, 10).await?;
-    let zone = make_zone_and_place(&h.client, pc).await?;
+    let zone = create_starting_zone(&h.client).await?;
+    let pc = make_char(&h.client, "Kira", 10, 10, Some(zone)).await?;
+    call(
+        &h.client,
+        "setup.mark_ready",
+        serde_json::json!({ "player_character_id": pc }),
+    )
+    .await?;
     // We also need the character to know they're in that zone (for drop_item to find
     // current_zone_id). setup.mark_ready already seeds knowledge, but not current_zone_id
     // on the character row — update via world.travel would be ideal; shortcut: place them
@@ -432,7 +447,7 @@ async fn drop_clears_encumbered_via_mcp() -> Result<()> {
 #[tokio::test]
 async fn equip_and_inspect_round_trip() -> Result<()> {
     let h = connect().await?;
-    let pc = make_char(&h.client, "Kira", 10, 10).await?;
+    let pc = make_char(&h.client, "Kira", 10, 10, None).await?;
     let sword = call(
         &h.client,
         "inventory.create",

@@ -323,6 +323,16 @@ impl Content {
             let wrapper: ItemBasesFile = parse(src)?;
             for (_category, entries) in wrapper.0 {
                 for (base_kind, base) in entries {
+                    // Reject duplicate base_kind across files — on disk `read_dir` order
+                    // is unspecified, so silent-overwrite would produce nondeterministic
+                    // weights/values for inventory and barter.
+                    if item_bases.contains_key(&base_kind) {
+                        anyhow::bail!(
+                            "duplicate item base_kind {:?} across items/bases/*.yaml (in {})",
+                            base_kind,
+                            src.label()
+                        );
+                    }
                     item_bases.insert(base_kind, base);
                 }
             }
@@ -413,6 +423,53 @@ impl Content {
                 );
             }
         }
+
+        // Item bases: weight_lb and base_value_gp must be non-negative. A missing/typoed
+        // field silently defaults to 0.0 via serde, which would break encumbrance and
+        // barter math — catch the bad YAML here so startup fails with a clear message.
+        for (kind, base) in &self.item_bases {
+            if base.weight_lb.is_nan() || base.weight_lb < 0.0 {
+                anyhow::bail!(
+                    "item base {kind:?} has invalid weight_lb = {} (must be ≥ 0)",
+                    base.weight_lb
+                );
+            }
+            if base.base_value_gp.is_nan() || base.base_value_gp < 0.0 {
+                anyhow::bail!(
+                    "item base {kind:?} has invalid base_value_gp = {} (must be ≥ 0)",
+                    base.base_value_gp
+                );
+            }
+        }
+
+        // Encumbrance: capacity > 0, both thresholds in 1..=100, encumbered ≤ overloaded.
+        let er = &self.encumbrance;
+        if er.capacity_per_str <= 0 {
+            anyhow::bail!(
+                "encumbrance.capacity_per_str must be > 0 (got {})",
+                er.capacity_per_str
+            );
+        }
+        if !(1..=100).contains(&er.encumbered_threshold_pct) {
+            anyhow::bail!(
+                "encumbrance.encumbered_threshold_pct must be in 1..=100 (got {})",
+                er.encumbered_threshold_pct
+            );
+        }
+        if !(1..=100).contains(&er.overloaded_threshold_pct) {
+            anyhow::bail!(
+                "encumbrance.overloaded_threshold_pct must be in 1..=100 (got {})",
+                er.overloaded_threshold_pct
+            );
+        }
+        if er.encumbered_threshold_pct > er.overloaded_threshold_pct {
+            anyhow::bail!(
+                "encumbrance.encumbered_threshold_pct ({}) must be ≤ overloaded_threshold_pct ({})",
+                er.encumbered_threshold_pct,
+                er.overloaded_threshold_pct
+            );
+        }
+
         Ok(())
     }
 

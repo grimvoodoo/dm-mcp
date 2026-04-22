@@ -72,9 +72,18 @@ pub fn exchange(
     content: &Content,
     p: ExchangeParams,
 ) -> Result<ExchangeResult> {
-    if p.offered_item_ids.is_empty() && p.requested_item_ids.is_empty() {
-        bail!("barter.exchange requires at least one item on either side");
+    // Both sides must contain at least one item — otherwise (especially with dc_override)
+    // a zero-item offer can enter the persuasion path and quietly win merchant goods.
+    if p.offered_item_ids.is_empty() || p.requested_item_ids.is_empty() {
+        bail!(
+            "barter.exchange requires at least one item on each side (got offered={}, requested={})",
+            p.offered_item_ids.len(),
+            p.requested_item_ids.len()
+        );
     }
+    // Duplicate IDs would double-count values and move the row once — reject both sides.
+    ensure_unique("offered_item_ids", &p.offered_item_ids)?;
+    ensure_unique("requested_item_ids", &p.requested_item_ids)?;
     if p.character_id == p.merchant_character_id {
         bail!("cannot barter with oneself");
     }
@@ -94,106 +103,103 @@ pub fn exchange(
         f64::INFINITY
     };
 
-    // Decision path.
-    if ratio < REFUSE_RATIO && p.dc_override.is_none() {
-        let event_id = emit_bargain_event(
-            conn,
-            &p,
-            offered_value,
-            requested_value,
-            "declined",
-            "refused",
-            None,
-            None,
-        )?;
-        return Ok(ExchangeResult {
-            outcome: "declined".to_string(),
-            offered_value_gp: offered_value,
-            requested_value_gp: requested_value,
-            resolution: "refused".to_string(),
-            check_dc: None,
-            check_roll_total: None,
-            event_id,
-        });
-    }
-
+    // Decision: refuse outright, auto-accept, or roll persuasion. Path + DC + roll are
+    // all computed before we open the transaction so the tx body is purely DB writes.
     let now = crate::world::current_campaign_hour(conn)?;
+    let path = decide_barter_path(&p, ratio);
+    let (outcome, resolution, check_dc, check_roll) = match path {
+        BarterPath::Refused => ("declined", "refused", None, None),
+        BarterPath::AutoAccept => ("accepted", "auto_accept", None, None),
+        BarterPath::PersuasionCheck => {
+            let dc = p.dc_override.unwrap_or_else(|| derive_dc(ratio));
+            let check = checks::resolve(
+                conn,
+                content,
+                ResolveCheckParams {
+                    character_id: p.character_id,
+                    kind: "skill_check".into(),
+                    target_key: "persuasion".into(),
+                    ability: None,
+                    dc: Some(dc),
+                    target_character_id: Some(p.merchant_character_id),
+                    modifiers: Vec::new(),
+                    advantage: None,
+                    disadvantage: None,
+                },
+            )
+            .context("resolve persuasion check for barter")?;
+            let success = check.success.unwrap_or(false);
+            (
+                if success { "accepted" } else { "declined" },
+                "persuasion_check",
+                Some(dc),
+                Some(check.total),
+            )
+        }
+    };
 
-    if ratio >= FAIR_RATIO && p.dc_override.is_none() {
-        // Auto-accept path.
-        execute_trade(conn, &p, now)?;
-        let event_id = emit_bargain_event(
-            conn,
-            &p,
-            offered_value,
-            requested_value,
-            "accepted",
-            "auto_accept",
-            None,
-            None,
-        )?;
-        return Ok(ExchangeResult {
-            outcome: "accepted".to_string(),
-            offered_value_gp: offered_value,
-            requested_value_gp: requested_value,
-            resolution: "auto_accept".to_string(),
-            check_dc: None,
-            check_roll_total: None,
-            event_id,
-        });
+    // Atomic: swap (if accepted) + social.bargain in one transaction. If event insertion
+    // fails for any reason, the swap rolls back and no state changes.
+    let tx = conn.transaction().context("begin barter tx")?;
+    if outcome == "accepted" {
+        swap_inventories_in_tx(&tx, &p, now)?;
     }
-
-    // Persuasion-check path.
-    let dc = p.dc_override.unwrap_or_else(|| derive_dc(ratio));
-    let check = checks::resolve(
-        conn,
-        content,
-        ResolveCheckParams {
-            character_id: p.character_id,
-            kind: "skill_check".into(),
-            target_key: "persuasion".into(),
-            ability: None,
-            dc: Some(dc),
-            target_character_id: Some(p.merchant_character_id),
-            modifiers: Vec::new(),
-            advantage: None,
-            disadvantage: None,
-        },
-    )
-    .context("resolve persuasion check for barter")?;
-    let success = check.success.unwrap_or(false);
-
-    if success {
-        execute_trade(conn, &p, now)?;
-    }
-
-    let event_id = emit_bargain_event(
-        conn,
+    let event_id = emit_bargain_event_in_tx(
+        &tx,
         &p,
         offered_value,
         requested_value,
-        if success { "accepted" } else { "declined" },
-        "persuasion_check",
-        Some(dc),
-        Some(check.total),
+        outcome,
+        resolution,
+        check_dc,
+        check_roll,
+        now,
     )?;
+    tx.commit().context("commit barter tx")?;
 
     Ok(ExchangeResult {
-        outcome: if success {
-            "accepted".into()
-        } else {
-            "declined".into()
-        },
+        outcome: outcome.to_string(),
         offered_value_gp: offered_value,
         requested_value_gp: requested_value,
-        resolution: "persuasion_check".into(),
-        check_dc: Some(dc),
-        check_roll_total: Some(check.total),
+        resolution: resolution.to_string(),
+        check_dc,
+        check_roll_total: check_roll,
         event_id,
     })
 }
 
+enum BarterPath {
+    Refused,
+    AutoAccept,
+    PersuasionCheck,
+}
+
+fn decide_barter_path(p: &ExchangeParams, ratio: f64) -> BarterPath {
+    // dc_override always takes the persuasion path (DMs use it for scripted checks; tests
+    // use it for forced outcomes).
+    if p.dc_override.is_some() {
+        return BarterPath::PersuasionCheck;
+    }
+    if ratio < REFUSE_RATIO {
+        BarterPath::Refused
+    } else if ratio >= FAIR_RATIO {
+        BarterPath::AutoAccept
+    } else {
+        BarterPath::PersuasionCheck
+    }
+}
+
 // ── Internals ────────────────────────────────────────────────────────────────
+
+fn ensure_unique(label: &str, ids: &[i64]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        if !seen.insert(*id) {
+            bail!("{label} contains duplicate id {id}");
+        }
+    }
+    Ok(())
+}
 
 fn sum_side_value(
     conn: &Connection,
@@ -218,35 +224,54 @@ fn sum_side_value(
     Ok(total)
 }
 
-fn execute_trade(conn: &mut Connection, p: &ExchangeParams, now: i64) -> Result<()> {
-    let tx = conn.transaction().context("begin barter trade tx")?;
+/// Swap both item sets inside the caller's transaction so the moves and the
+/// `social.bargain` emission are atomic. If any UPDATE leaves zero rows (e.g. the id was
+/// stale) we bail before committing — the caller rolls the tx back.
+fn swap_inventories_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ExchangeParams,
+    now: i64,
+) -> Result<()> {
     for iid in &p.offered_item_ids {
-        tx.execute(
-            "UPDATE items
+        let n = tx
+            .execute(
+                "UPDATE items
              SET holder_character_id = ?1, zone_location_id = NULL, container_item_id = NULL,
                  equipped_slot = NULL, updated_at = ?2
-             WHERE id = ?3",
-            params![p.merchant_character_id, now, *iid],
-        )
-        .with_context(|| format!("move offered item {iid}"))?;
+             WHERE id = ?3 AND holder_character_id = ?4",
+                params![p.merchant_character_id, now, *iid, p.character_id],
+            )
+            .with_context(|| format!("move offered item {iid}"))?;
+        if n == 0 {
+            bail!(
+                "offered item {iid} is no longer held by character {}",
+                p.character_id
+            );
+        }
     }
     for iid in &p.requested_item_ids {
-        tx.execute(
-            "UPDATE items
+        let n = tx
+            .execute(
+                "UPDATE items
              SET holder_character_id = ?1, zone_location_id = NULL, container_item_id = NULL,
                  equipped_slot = NULL, updated_at = ?2
-             WHERE id = ?3",
-            params![p.character_id, now, *iid],
-        )
-        .with_context(|| format!("move requested item {iid}"))?;
+             WHERE id = ?3 AND holder_character_id = ?4",
+                params![p.character_id, now, *iid, p.merchant_character_id],
+            )
+            .with_context(|| format!("move requested item {iid}"))?;
+        if n == 0 {
+            bail!(
+                "requested item {iid} is no longer held by merchant {}",
+                p.merchant_character_id
+            );
+        }
     }
-    tx.commit().context("commit barter trade tx")?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_bargain_event(
-    conn: &mut Connection,
+fn emit_bargain_event_in_tx(
+    tx: &rusqlite::Transaction<'_>,
     p: &ExchangeParams,
     offered: f64,
     requested: f64,
@@ -254,8 +279,8 @@ fn emit_bargain_event(
     resolution: &str,
     check_dc: Option<i32>,
     roll_total: Option<i64>,
+    now: i64,
 ) -> Result<i64> {
-    let now = crate::world::current_campaign_hour(conn)?;
     let participants = [
         Participant {
             character_id: p.character_id,
@@ -278,8 +303,8 @@ fn emit_bargain_event(
             role: "requested",
         }))
         .collect();
-    let emitted = events::emit(
-        conn,
+    let emitted = events::emit_in_tx(
+        tx,
         &EventSpec {
             kind: "social.bargain",
             campaign_hour: now,
@@ -496,6 +521,56 @@ mod tests {
             crate_holder, merchant,
             "failed persuasion must not move items"
         );
+    }
+
+    #[test]
+    fn empty_side_is_rejected_even_with_dc_override() {
+        // Regression: without the empty-side guard, dc_override could drive the persuasion
+        // path on a zero-item offer and rob the merchant on a good roll.
+        let (mut conn, content) = fresh();
+        let pc = make_char(&mut conn, "P", "player", 14);
+        let merchant = make_char(&mut conn, "M", "neutral", 10);
+        let crate_id = make_item(&mut conn, &content, "heavy_crate", merchant, 1);
+        let err = exchange(
+            &mut conn,
+            &content,
+            ExchangeParams {
+                character_id: pc,
+                merchant_character_id: merchant,
+                offered_item_ids: vec![],
+                requested_item_ids: vec![crate_id],
+                dc_override: Some(1),
+            },
+        )
+        .expect_err("empty offered side must be rejected");
+        assert!(
+            format!("{err:#}").contains("at least one item on each side"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn duplicate_item_ids_are_rejected() {
+        // Regression: without the dedup guard, duplicates would double-count value and
+        // only move the row once.
+        let (mut conn, content) = fresh();
+        let pc = make_char(&mut conn, "P", "player", 10);
+        let merchant = make_char(&mut conn, "M", "neutral", 10);
+        let gold = make_item(&mut conn, &content, "gold", pc, 1);
+        let crate_id = make_item(&mut conn, &content, "heavy_crate", merchant, 1);
+        let err = exchange(
+            &mut conn,
+            &content,
+            ExchangeParams {
+                character_id: pc,
+                merchant_character_id: merchant,
+                offered_item_ids: vec![gold, gold],
+                requested_item_ids: vec![crate_id],
+                dc_override: None,
+            },
+        )
+        .expect_err("duplicate offered ids must be rejected");
+        assert!(format!("{err:#}").contains("duplicate"), "got: {err:#}");
     }
 
     #[test]
