@@ -217,7 +217,10 @@ CREATE TABLE IF NOT EXISTS items (
 
     holder_character_id   INTEGER REFERENCES characters(id) ON DELETE SET NULL,
     container_item_id     INTEGER REFERENCES items(id)      ON DELETE SET NULL,
-    zone_location_id      INTEGER,     -- zones(id) — FK added via trigger-free CHECK
+    -- SQLite allows forward-referencing FKs in the same DDL batch; `zones` is created
+    -- further down this same migration and the FK resolves at execute time under
+    -- foreign_keys=ON. Symmetric with the other two location columns.
+    zone_location_id      INTEGER REFERENCES zones(id)      ON DELETE SET NULL,
 
     equipped_slot         TEXT,
 
@@ -531,5 +534,42 @@ mod tests {
             [],
         )
         .expect("holder-only item should be accepted");
+    }
+
+    #[test]
+    fn item_zone_location_fk_is_enforced() {
+        // Regression guard: previously zone_location_id had no FK declared, so an item
+        // could reference a nonexistent zone. The previous mutex test masked this by also
+        // setting holder_character_id, which made the mutex CHECK reject the row before
+        // the FK could matter.
+        let mut conn = in_memory();
+        migrate(&mut conn).expect("migrate");
+
+        // No zones exist. zone_location_id=999 should fail the FK.
+        let err = conn
+            .execute(
+                "INSERT INTO items (base_kind, quantity, zone_location_id, updated_at)
+                 VALUES ('gold', 1, 999, 0)",
+                [],
+            )
+            .expect_err("zone_location_id pointing at nonexistent zone should be rejected");
+        assert!(
+            format!("{err:#}").contains("FOREIGN KEY"),
+            "expected FOREIGN KEY violation, got {err}"
+        );
+
+        // Insert a real zone and then the item should be accepted.
+        conn.execute(
+            "INSERT INTO zones (id, name, biome, kind, size)
+             VALUES (1, 'Test', 'temperate_forest', 'wilderness', 'small')",
+            [],
+        )
+        .expect("insert zone");
+        conn.execute(
+            "INSERT INTO items (base_kind, quantity, zone_location_id, updated_at)
+             VALUES ('gold', 1, 1, 0)",
+            [],
+        )
+        .expect("item referencing real zone should be accepted");
     }
 }

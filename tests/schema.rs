@@ -44,7 +44,11 @@ fn bin_path() -> std::path::PathBuf {
 }
 
 fn test_port() -> u16 {
-    const BASE: u16 = 18_500;
+    // Shifted to 19_500..20_499 so the PID-derived port can never collide with
+    // tests/healthz.rs (18_000..18_999) regardless of how the PID values line up.
+    // Ideally the binary would bind 127.0.0.1:0 and report its port back; that's a
+    // follow-up when we gain a "report-bound-port" signal on the HTTP transport.
+    const BASE: u16 = 19_500;
     BASE + (std::process::id() as u16 % 1_000)
 }
 

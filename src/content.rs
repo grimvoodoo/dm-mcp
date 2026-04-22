@@ -2,7 +2,7 @@
 //!
 //! Per the architectural principle: **content is data, not code**. Everything that describes
 //! *what a thing is* (ability definitions, conditions, archetypes, item base-kinds) lives
-//! under `content/` and ships inside the binary via `include_str!`. Only instance data lives
+//! under `content/` and ships inside the binary via `include_dir!`. Only instance data lives
 //! in SQLite.
 //!
 //! See:
@@ -11,26 +11,33 @@
 //!
 //! `DMMCP_CONTENT_DIR` (if set) loads from disk instead of the embedded copy, for dev
 //! iteration or user customisation without rebuilding.
+//!
+//! ### Embedded vs on-disk path symmetry
+//!
+//! Both loading paths enumerate files from the same relative layout (`rules/abilities.yaml`,
+//! `npcs/archetypes/*.yaml`, etc.). The embedded path reads from a compile-time `Dir` tree
+//! built by [`include_dir!`]; the on-disk path walks the filesystem. A new YAML under
+//! `content/npcs/archetypes/` is picked up by both paths automatically — there's no manual
+//! `include_str!` list to keep in sync.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
+use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 
-// ── Embedded content ──────────────────────────────────────────────────────────
-//
-// Files are bundled at compile time. The paths are relative to this source file (Cargo
-// rewrites them to be relative to CARGO_MANIFEST_DIR when it applies the macro).
+/// Compile-time snapshot of `content/`. Paths inside are relative to the directory root
+/// (e.g. `rules/abilities.yaml`, `npcs/archetypes/village_elder.yaml`).
+static CONTENT_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/content");
 
-const ABILITIES_YAML: &str = include_str!("../content/rules/abilities.yaml");
-const SKILLS_YAML: &str = include_str!("../content/rules/skills.yaml");
-const DAMAGE_TYPES_YAML: &str = include_str!("../content/rules/damage_types.yaml");
-const CONDITIONS_YAML: &str = include_str!("../content/rules/conditions.yaml");
-const BIOMES_YAML: &str = include_str!("../content/world/biomes.yaml");
-const WEAPONS_YAML: &str = include_str!("../content/items/bases/weapons.yaml");
-const ENCHANTMENTS_YAML: &str = include_str!("../content/items/enchantments.yaml");
-const VILLAGE_ELDER_YAML: &str = include_str!("../content/npcs/archetypes/village_elder.yaml");
+/// File extension is `.yaml` or `.yml`, case-insensitive.
+fn is_yaml_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
+    )
+}
 
 // ── Section wrappers ──────────────────────────────────────────────────────────
 //
@@ -120,71 +127,48 @@ pub struct Content {
     pub archetypes: BTreeMap<String, Archetype>,
 }
 
+/// Source of a single YAML file's bytes. Hides the difference between embedded (`&'static
+/// str`) and on-disk (`String`) so the parsing code is shared.
+enum YamlSource<'a> {
+    Embedded { path: &'a str, source: &'a str },
+    OnDisk { path: String, source: String },
+}
+
+impl YamlSource<'_> {
+    fn label(&self) -> String {
+        match self {
+            YamlSource::Embedded { path, .. } => format!("{path} (embedded)"),
+            YamlSource::OnDisk { path, .. } => path.clone(),
+        }
+    }
+    fn text(&self) -> &str {
+        match self {
+            YamlSource::Embedded { source, .. } => source,
+            YamlSource::OnDisk { source, .. } => source,
+        }
+    }
+}
+
 impl Content {
     /// Load content. If `override_dir` is `Some`, read every file from that directory
     /// (expecting the same sub-layout as `content/`). Otherwise use the embedded copies.
     pub fn load(override_dir: Option<&Path>) -> Result<Self> {
-        match override_dir {
-            Some(dir) => Self::load_from_dir(dir),
-            None => Self::load_embedded(),
-        }
-    }
+        let abilities: AbilitiesFile = parse(&get(override_dir, "rules/abilities.yaml")?)?;
+        let skills: SkillsFile = parse(&get(override_dir, "rules/skills.yaml")?)?;
+        let damage_types: DamageTypesFile = parse(&get(override_dir, "rules/damage_types.yaml")?)?;
+        let conditions: ConditionsFile = parse(&get(override_dir, "rules/conditions.yaml")?)?;
+        let biomes: BiomesFile = parse(&get(override_dir, "world/biomes.yaml")?)?;
+        let weapons: WeaponsFile = parse(&get(override_dir, "items/bases/weapons.yaml")?)?;
+        let enchantments: EnchantmentsFile = parse(&get(override_dir, "items/enchantments.yaml")?)?;
 
-    fn load_embedded() -> Result<Self> {
-        let abilities: AbilitiesFile = parse(ABILITIES_YAML, "rules/abilities.yaml (embedded)")?;
-        let skills: SkillsFile = parse(SKILLS_YAML, "rules/skills.yaml (embedded)")?;
-        let damage_types: DamageTypesFile =
-            parse(DAMAGE_TYPES_YAML, "rules/damage_types.yaml (embedded)")?;
-        let conditions: ConditionsFile =
-            parse(CONDITIONS_YAML, "rules/conditions.yaml (embedded)")?;
-        let biomes: BiomesFile = parse(BIOMES_YAML, "world/biomes.yaml (embedded)")?;
-        let weapons: WeaponsFile = parse(WEAPONS_YAML, "items/bases/weapons.yaml (embedded)")?;
-        let enchantments: EnchantmentsFile =
-            parse(ENCHANTMENTS_YAML, "items/enchantments.yaml (embedded)")?;
-
+        // Archetypes: discover every *.yaml / *.yml under npcs/archetypes/ in whichever
+        // source we're using. Embedded and on-disk use the same iteration logic so a new
+        // archetype file is picked up by both paths automatically.
         let mut archetypes = BTreeMap::new();
-        archetypes.insert(
-            "village_elder".to_string(),
-            parse::<Archetype>(
-                VILLAGE_ELDER_YAML,
-                "npcs/archetypes/village_elder.yaml (embedded)",
-            )?,
-        );
-
-        Self::assemble(
-            abilities.abilities,
-            skills.skills,
-            damage_types.damage_types,
-            conditions.conditions,
-            biomes.biomes,
-            weapons.weapons,
-            enchantments.enchantments,
-            archetypes,
-        )
-    }
-
-    fn load_from_dir(dir: &Path) -> Result<Self> {
-        let abilities: AbilitiesFile = parse_file(&dir.join("rules/abilities.yaml"))?;
-        let skills: SkillsFile = parse_file(&dir.join("rules/skills.yaml"))?;
-        let damage_types: DamageTypesFile = parse_file(&dir.join("rules/damage_types.yaml"))?;
-        let conditions: ConditionsFile = parse_file(&dir.join("rules/conditions.yaml"))?;
-        let biomes: BiomesFile = parse_file(&dir.join("world/biomes.yaml"))?;
-        let weapons: WeaponsFile = parse_file(&dir.join("items/bases/weapons.yaml"))?;
-        let enchantments: EnchantmentsFile = parse_file(&dir.join("items/enchantments.yaml"))?;
-
-        let mut archetypes = BTreeMap::new();
-        let archetype_dir = dir.join("npcs/archetypes");
-        if archetype_dir.is_dir() {
-            for entry in std::fs::read_dir(&archetype_dir)
-                .with_context(|| format!("read archetype dir {}", archetype_dir.display()))?
-            {
-                let entry = entry?;
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("yaml") {
-                    let a: Archetype = parse_file(&p)?;
-                    archetypes.insert(a.id.clone(), a);
-                }
-            }
+        let archetype_sources = list_archetype_files(override_dir)?;
+        for src in &archetype_sources {
+            let a: Archetype = parse(src)?;
+            archetypes.insert(a.id.clone(), a);
         }
 
         Self::assemble(
@@ -272,16 +256,91 @@ pub struct Introspection {
     pub archetypes: Vec<String>,
 }
 
-// ── Parse helpers ─────────────────────────────────────────────────────────────
+// ── Source lookup ─────────────────────────────────────────────────────────────
 
-fn parse<T: for<'de> Deserialize<'de>>(source: &str, label: &str) -> Result<T> {
-    serde_yaml_ng::from_str(source).with_context(|| format!("parse {label}"))
+/// Fetch a YAML file by its relative path, from the override dir if set, else the embedded
+/// bundle. Fails with a clear error if the file is missing.
+fn get<'a>(override_dir: Option<&Path>, rel: &'a str) -> Result<YamlSource<'a>> {
+    match override_dir {
+        Some(dir) => {
+            let abs = dir.join(rel);
+            let source =
+                std::fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
+            Ok(YamlSource::OnDisk {
+                path: abs.display().to_string(),
+                source,
+            })
+        }
+        None => {
+            let file = CONTENT_DIR
+                .get_file(rel)
+                .with_context(|| format!("embedded content missing: {rel}"))?;
+            let source = file
+                .contents_utf8()
+                .with_context(|| format!("embedded {rel} is not UTF-8"))?;
+            Ok(YamlSource::Embedded { path: rel, source })
+        }
+    }
 }
 
-fn parse_file<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Result<T> {
-    let source =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_yaml_ng::from_str(&source).with_context(|| format!("parse {}", path.display()))
+/// Enumerate every `*.yaml` / `*.yml` under `npcs/archetypes/` in whichever source is active.
+fn list_archetype_files<'a>(override_dir: Option<&Path>) -> Result<Vec<YamlSource<'a>>> {
+    let mut out = Vec::new();
+    match override_dir {
+        Some(dir) => {
+            let archetype_dir = dir.join("npcs/archetypes");
+            if archetype_dir.is_dir() {
+                for entry in std::fs::read_dir(&archetype_dir)
+                    .with_context(|| format!("read archetype dir {}", archetype_dir.display()))?
+                {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if is_yaml_file(&path) {
+                        let source = std::fs::read_to_string(&path)
+                            .with_context(|| format!("read {}", path.display()))?;
+                        out.push(YamlSource::OnDisk {
+                            path: path.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+        None => {
+            let archetype_dir = CONTENT_DIR
+                .get_dir("npcs/archetypes")
+                .context("embedded content missing npcs/archetypes/")?;
+            // We deliberately iterate `files()` (non-recursive) rather than `find("*.yaml")`
+            // so the list tracks the on-disk walker exactly.
+            for file in archetype_dir.files() {
+                let path = file.path();
+                if is_yaml_file(path) {
+                    let source = file
+                        .contents_utf8()
+                        .with_context(|| format!("embedded {} is not UTF-8", path.display()))?;
+                    // include_dir owns the &str for &'static program lifetime; we can keep
+                    // a static reference to the path too.
+                    out.push(YamlSource::Embedded {
+                        path: static_path_str(path),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Leak a Path's string into a `'static` slice via Box::leak. Only called once per embedded
+/// archetype file at startup — fine for a bounded, small content set.
+fn static_path_str(p: &Path) -> &'static str {
+    Box::leak(p.display().to_string().into_boxed_str())
+}
+
+// ── Parse helpers ─────────────────────────────────────────────────────────────
+
+fn parse<T: for<'de> Deserialize<'de>>(src: &YamlSource<'_>) -> Result<T> {
+    serde_yaml_ng::from_str(src.text()).with_context(|| format!("parse {}", src.label()))
 }
 
 #[cfg(test)]
@@ -351,11 +410,63 @@ mod tests {
 
     #[test]
     fn dir_override_reads_yaml_from_disk() {
-        // Use the real content/ directory as the override — should match the embedded copy.
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let content_dir = repo_root.join("content");
         let c = Content::load(Some(&content_dir)).expect("load from content/");
         assert_eq!(c.abilities.len(), 6);
+        assert!(c.archetypes.contains_key("village_elder"));
+    }
+
+    #[test]
+    fn yml_extension_is_also_accepted() {
+        // Sanity-check the extension matcher without manipulating the real fixtures.
+        assert!(is_yaml_file(Path::new("foo.yaml")));
+        assert!(is_yaml_file(Path::new("foo.yml")));
+        assert!(is_yaml_file(Path::new("FOO.YAML")));
+        assert!(is_yaml_file(Path::new("bar.YML")));
+        assert!(!is_yaml_file(Path::new("foo.json")));
+        assert!(!is_yaml_file(Path::new("foo.txt")));
+        assert!(!is_yaml_file(Path::new("foo")));
+    }
+
+    #[test]
+    fn override_dir_picks_up_extra_archetype_that_embedded_does_not() {
+        // Build a tmp dir that mirrors the real content/, drop in a second archetype, and
+        // verify Content::load(Some(&tmp)) discovers it. This is the regression guard
+        // against silent embedded/on-disk divergence (CodeRabbit PR #5 review).
+        use std::fs;
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let real_content = repo_root.join("content");
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+
+        fn copy_dir(src: &Path, dst: &Path) {
+            fs::create_dir_all(dst).unwrap();
+            for entry in fs::read_dir(src).unwrap() {
+                let entry = entry.unwrap();
+                let ft = entry.file_type().unwrap();
+                let from = entry.path();
+                let to = dst.join(entry.file_name());
+                if ft.is_dir() {
+                    copy_dir(&from, &to);
+                } else if ft.is_file() {
+                    fs::copy(&from, &to).unwrap();
+                }
+            }
+        }
+        copy_dir(&real_content, tmp.path());
+
+        let extra = tmp.path().join("npcs/archetypes/test_bandit.yaml");
+        fs::write(
+            &extra,
+            "id: test_bandit\nspecies: human\nrole_hint: enemy\n",
+        )
+        .unwrap();
+
+        let c = Content::load(Some(tmp.path())).expect("load from override");
+        assert!(
+            c.archetypes.contains_key("test_bandit"),
+            "override-dir path should auto-discover new archetype YAML files"
+        );
         assert!(c.archetypes.contains_key("village_elder"));
     }
 }
