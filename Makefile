@@ -88,7 +88,7 @@ demo: _build-debug
 # ─────────────────────────────────────────────────────────────────────────────
 clean: _service-stop
 	@cargo clean
-	@rm -rf $(LOG_DIR) $(PID_DIR)
+	@rm -rf -- "$(LOG_DIR)" "$(PID_DIR)"
 	@echo "✓ Cleaned"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ build:
 # ─────────────────────────────────────────────────────────────────────────────
 reset: _service-stop
 	@echo "→ Removing $(DB_PATH) (+ WAL sidecars)..."
-	@rm -f $(DB_PATH) $(DB_PATH)-wal $(DB_PATH)-shm
+	@rm -f -- "$(DB_PATH)" "$(DB_PATH)-wal" "$(DB_PATH)-shm"
 	@echo "✓ Campaign database wiped"
 	@echo "  Run 'make dev' to start with a fresh campaign."
 
