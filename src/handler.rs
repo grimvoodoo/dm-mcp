@@ -26,6 +26,10 @@ use crate::proficiencies::{
     self, AdjustResourceParams, RemoveProficiencyParams, RemoveResourceParams,
     SetProficiencyParams, SetResourceParams,
 };
+use crate::setup::{
+    self, AnswerParams as SetupAnswerParams, GenerateWorldParams, MarkReadyParams,
+    NewCampaignParams,
+};
 
 /// Arguments for the `dice.roll` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -345,8 +349,6 @@ impl DmMcpHandler {
         &self,
         Parameters(params): Parameters<ResolveCheckParams>,
     ) -> Result<CallToolResult, McpError> {
-        // resolve_check needs both the DB and content; the with_db_mut helper only
-        // threads the DB, so do the mutex + content wiring inline.
         let content = Arc::clone(&self.content);
         let value = {
             let mut conn = self
@@ -359,6 +361,85 @@ impl DmMcpHandler {
         let json = serde_json::to_string(&value)
             .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    // ── Campaign setup (Phase 6) ──────────────────────────────────────────────
+
+    #[tool(
+        name = "setup.new_campaign",
+        description = "Confirm the campaign is in the setup phase and return the bootstrap questions to ask the player. The DB schema is created at server startup; this tool is the protocol-level entry point into the setup flow."
+    )]
+    async fn setup_new_campaign(
+        &self,
+        Parameters(_): Parameters<NewCampaignParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            setup::new_campaign(&conn, &content)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "setup.answer",
+        description = "Record the player's answer to one setup question. The answer is JSON — a string for single-choice, an array of strings for multi-select. Re-answering the same question id overwrites the previous value."
+    )]
+    async fn setup_answer(
+        &self,
+        Parameters(params): Parameters<SetupAnswerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            setup::answer(&mut conn, &content, params)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "setup.generate_world",
+        description = "Generate the starting zone and 2-5 stub neighbours from the recorded answers. Phase 6 reads the starting_biome answer; later phases will use enemy_preference, tone, etc. Emits a world.generated event. Requires starting_biome to have been answered."
+    )]
+    async fn setup_generate_world(
+        &self,
+        Parameters(_): Parameters<GenerateWorldParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let content = Arc::clone(&self.content);
+        let value = {
+            let mut conn = self
+                .db
+                .lock()
+                .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
+            setup::generate_world(&mut conn, &content)
+                .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        };
+        let json = serde_json::to_string(&value)
+            .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "setup.mark_ready",
+        description = "Flip the campaign from 'setup' to 'running'. Records the wall-clock moment as `started_at` on the campaign_state singleton and emits a campaign.started event. Optionally records the player character id for later 'who is the player?' lookups."
+    )]
+    async fn setup_mark_ready(
+        &self,
+        Parameters(params): Parameters<MarkReadyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        with_db_mut(&self.db, |conn| setup::mark_ready(conn, params))
     }
 }
 

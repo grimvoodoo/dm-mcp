@@ -82,6 +82,11 @@ struct EnchantmentsFile {
     enchantments: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetupQuestionsFile {
+    questions: Vec<SetupQuestion>,
+}
+
 // ── Public content types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +119,20 @@ pub struct Archetype {
     pub extra: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupQuestion {
+    pub id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// If true, the player may answer outside the provided options.
+    #[serde(default)]
+    pub or_free_text: bool,
+    /// If true, the answer is an array of selected options.
+    #[serde(default)]
+    pub multi: bool,
+}
+
 /// Parsed content, ready for tool lookups. Held in an `Arc` and shared across MCP sessions.
 #[derive(Debug)]
 pub struct Content {
@@ -125,6 +144,7 @@ pub struct Content {
     pub weapons: BTreeMap<String, serde_yaml_ng::Value>,
     pub enchantments: BTreeMap<String, serde_yaml_ng::Value>,
     pub archetypes: BTreeMap<String, Archetype>,
+    pub setup_questions: Vec<SetupQuestion>,
 }
 
 /// Source of a single YAML file's bytes. Hides the difference between embedded (`&'static
@@ -160,6 +180,8 @@ impl Content {
         let biomes: BiomesFile = parse(&get(override_dir, "world/biomes.yaml")?)?;
         let weapons: WeaponsFile = parse(&get(override_dir, "items/bases/weapons.yaml")?)?;
         let enchantments: EnchantmentsFile = parse(&get(override_dir, "items/enchantments.yaml")?)?;
+        let setup_questions: SetupQuestionsFile =
+            parse(&get(override_dir, "campaign/setup_questions.yaml")?)?;
 
         // Archetypes: discover every *.yaml / *.yml under npcs/archetypes/ in whichever
         // source we're using. Embedded and on-disk use the same iteration logic so a new
@@ -180,6 +202,7 @@ impl Content {
             weapons.weapons,
             enchantments.enchantments,
             archetypes,
+            setup_questions.questions,
         )
     }
 
@@ -193,6 +216,7 @@ impl Content {
         weapons: BTreeMap<String, serde_yaml_ng::Value>,
         enchantments: BTreeMap<String, serde_yaml_ng::Value>,
         archetypes: BTreeMap<String, Archetype>,
+        setup_questions: Vec<SetupQuestion>,
     ) -> Result<Self> {
         let content = Self {
             abilities,
@@ -203,6 +227,7 @@ impl Content {
             weapons,
             enchantments,
             archetypes,
+            setup_questions,
         };
         content.validate()?;
         Ok(content)
@@ -238,6 +263,7 @@ impl Content {
             weapons: self.weapons.keys().cloned().collect(),
             enchantments: self.enchantments.keys().cloned().collect(),
             archetypes: self.archetypes.keys().cloned().collect(),
+            setup_questions: self.setup_questions.iter().map(|q| q.id.clone()).collect(),
         }
     }
 }
@@ -334,6 +360,7 @@ pub struct Introspection {
     pub weapons: Vec<String>,
     pub enchantments: Vec<String>,
     pub archetypes: Vec<String>,
+    pub setup_questions: Vec<String>,
 }
 
 // ── Source lookup ─────────────────────────────────────────────────────────────
@@ -477,6 +504,7 @@ mod tests {
             weapons: BTreeMap::new(),
             enchantments: BTreeMap::new(),
             archetypes: BTreeMap::new(),
+            setup_questions: vec![],
         };
         let err = content
             .validate()

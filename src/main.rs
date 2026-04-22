@@ -22,6 +22,7 @@ mod effects;
 mod events;
 mod handler;
 mod proficiencies;
+mod setup;
 mod transport;
 
 use crate::config::Config;
