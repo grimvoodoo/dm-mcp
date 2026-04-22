@@ -2,9 +2,10 @@
 #
 #   make dev         Build + start the server over HTTP for manual testing
 #   make run-stdio   Attach the stdio transport to this terminal
+#   make demo        Walkthrough: spawn stdio, handshake, list tools, call server.info
 #   make clean       Stop the dev server, wipe build artefacts and logs
 #   make logs        Tail the dev server log
-#   make test        Run the full test suite (cargo test)
+#   make test        Run the full automated test suite (cargo test)
 #   make check       Run all CI quality gates locally — matches ci.yaml
 #   make audit       cargo audit + verify rustls-only — matches commit.yaml
 #   make build       Release build (scratch-container target)
@@ -25,7 +26,7 @@ LOG_DIR     := .logs
 PID_DIR     := .pids
 
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: dev run-stdio clean logs test check audit build reset health \
+.PHONY: dev run-stdio demo clean logs test check audit build reset health \
         _build-debug _service-start _service-stop _sweep-stale \
         _check-fmt _check-clippy _check-no-openssl
 
@@ -62,6 +63,24 @@ run-stdio:
 	@DMMCP_DB_PATH=$(DB_PATH) \
 	 DMMCP_LOG_LEVEL=$(LOG_LEVEL) \
 	 cargo run --quiet -- stdio
+
+# ─────────────────────────────────────────────────────────────────────────────
+## demo: Manual-test walkthrough — spawn stdio, handshake, call server.info
+##      Builds the debug binary, then runs examples/manual_demo, which acts as
+##      a real MCP client:
+##        1. spawns dm-mcp as an MCP stdio child process
+##        2. completes the MCP handshake
+##        3. lists the registered tools
+##        4. calls server.info and pretty-prints the JSON response
+##        5. cancels the session cleanly
+##      Every step prints what the client sees — use this when you want to
+##      eyeball the server's responses without running the full test suite.
+##
+##      To see the raw JSON-RPC frames on stderr:
+##        RUST_LOG=rmcp=trace make demo
+# ─────────────────────────────────────────────────────────────────────────────
+demo: _build-debug
+	@cargo run --quiet --example manual_demo
 
 # ─────────────────────────────────────────────────────────────────────────────
 ## clean: Stop the dev server and wipe build artefacts

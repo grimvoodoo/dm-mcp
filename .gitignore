@@ -1,1 +1,10 @@
 /target
+
+# Makefile runtime artefacts — server PIDs and logs written by `make dev`.
+/.pids
+/.logs
+
+# Local campaign databases (incl. WAL sidecars) created by the dev server.
+/campaign.db
+/campaign.db-wal
+/campaign.db-shm
