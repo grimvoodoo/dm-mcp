@@ -7,11 +7,22 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::content::Content as ContentCatalog;
+use crate::dice;
+
+/// Arguments for the `dice.roll` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DiceRollParams {
+    /// Dice notation. Accepted shapes: `d4`/`d6`/`d8`/`d10`/`d12`/`d20`/`d100` (single die),
+    /// `3d6` (count × sides), or `11-43` (inclusive integer range).
+    pub spec: String,
+}
 
 /// The transport this server instance is currently serving. Reported by `server.info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -96,6 +107,25 @@ impl DmMcpHandler {
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    /// Roll dice notation. Supports `d4..=d100`, `NdM` multi-dice, and inclusive ranges
+    /// (`11-43`). Returns the total plus the individual rolls so the DM agent can narrate
+    /// "you rolled a 4 and a 6" rather than just the sum.
+    #[tool(
+        name = "dice.roll",
+        description = "Roll dice notation. Accepts standard dice (d4, d6, d8, d10, d12, d20, d100), multi-dice (NdM, e.g. 3d6), or an inclusive integer range (e.g. 11-43). Returns {spec, total, rolls: [...]}."
+    )]
+    async fn dice_roll(
+        &self,
+        Parameters(DiceRollParams { spec }): Parameters<DiceRollParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = dice::roll(&spec)
+            .map_err(|e| McpError::invalid_params(format!("dice.roll: {e:#}"), None))?;
+        let json = serde_json::to_string(&result).map_err(|e| {
+            McpError::internal_error(format!("failed to serialize dice.roll payload: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
@@ -110,7 +140,7 @@ impl ServerHandler for DmMcpHandler {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(
-            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 2 adds the campaign DB and content catalog; server.info + content.introspect are live.".to_string(),
+            "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 3 adds dice rolling. Live tools: server.info, content.introspect, dice.roll.".to_string(),
         );
         info
     }
