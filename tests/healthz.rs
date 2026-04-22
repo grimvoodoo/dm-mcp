@@ -16,7 +16,7 @@ use tokio::time::sleep;
 fn test_port() -> u16 {
     // Stay well clear of ephemeral ports; Linux's default ip_local_port_range starts at 32768.
     const BASE: u16 = 18_000;
-    (BASE + (std::process::id() as u16 % 1_000)).max(BASE)
+    BASE + (std::process::id() as u16 % 1_000)
 }
 
 fn bin_path() -> std::path::PathBuf {
@@ -53,7 +53,9 @@ async fn spawn_http(port: u16) -> anyhow::Result<Child> {
         .env("DMMCP_LOG_LEVEL", "warn")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        // Discard stderr — the tests don't assert on log output, and a piped-but-undrained
+        // stderr would block the child once a later phase's logging fills the pipe (~64 KB).
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
     Ok(child)

@@ -1,0 +1,9 @@
+# actionlint configuration — registers custom self-hosted runner labels so they
+# don't get flagged as unknown when workflows are linted.
+#
+# `arc-runner-dm-mcp` is a self-hosted Actions Runner Controller label for this
+# project's Kubernetes runner pods.
+
+self-hosted-runner:
+  labels:
+    - arc-runner-dm-mcp

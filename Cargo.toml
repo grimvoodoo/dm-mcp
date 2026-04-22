@@ -14,7 +14,7 @@ path = "src/main.rs"
 anyhow = "1.0.102"
 axum = "0.8.9"
 clap = { version = "4.6.1", features = ["derive"] }
-rmcp = { version = "1.5.0", features = ["server", "macros", "client", "transport-io", "transport-streamable-http-server", "transport-child-process", "schemars"] }
+rmcp = { version = "1.5.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -26,6 +26,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 assert_cmd = "2.2.1"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json"] }
+# client + transport-child-process are test-only (tests/stdio_server_info.rs drives the
+# binary as an MCP child over stdio). Keeping them out of the release build narrows the
+# surface of the `scratch` container image.
+rmcp = { version = "1.5.0", features = ["client", "transport-child-process"] }
 tempfile = "3.27.0"
 
 [profile.release]

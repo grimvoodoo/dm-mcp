@@ -54,12 +54,16 @@ impl Config {
                 path: env_or("DMMCP_DB_PATH", PathBuf::from("./campaign.db"), |v| {
                     Ok(PathBuf::from(v))
                 })?,
-                journal_mode: env_or("DMMCP_DB_JOURNAL_MODE", "WAL".to_string(), |v| {
-                    Ok(v.to_string())
-                })?,
-                synchronous: env_or("DMMCP_DB_SYNCHRONOUS", "NORMAL".to_string(), |v| {
-                    Ok(v.to_string())
-                })?,
+                journal_mode: env_or(
+                    "DMMCP_DB_JOURNAL_MODE",
+                    "WAL".to_string(),
+                    parse_journal_mode,
+                )?,
+                synchronous: env_or(
+                    "DMMCP_DB_SYNCHRONOUS",
+                    "NORMAL".to_string(),
+                    parse_synchronous,
+                )?,
                 mmap_size: env_or("DMMCP_DB_MMAP_SIZE", 67_108_864_i64, parse_str)?,
                 cache_size: env_or("DMMCP_DB_CACHE_SIZE", -32_768_i64, parse_str)?,
             },
@@ -89,6 +93,31 @@ where
 {
     v.parse::<T>()
         .map_err(|e| anyhow::anyhow!("parse error: {e}"))
+}
+
+/// Accept any documented SQLite `journal_mode` value. Normalise to uppercase so the PRAGMA
+/// string produced later is consistent regardless of how the operator typed the env var.
+/// Reject unknown values up-front rather than letting the DB connection fail at startup of
+/// whichever phase first opens it.
+fn parse_journal_mode(v: &str) -> Result<String> {
+    let upper = v.to_ascii_uppercase();
+    match upper.as_str() {
+        "DELETE" | "TRUNCATE" | "PERSIST" | "MEMORY" | "WAL" | "OFF" => Ok(upper),
+        _ => anyhow::bail!(
+            "unsupported SQLite journal_mode {v:?}; expected one of DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF"
+        ),
+    }
+}
+
+/// Accept any documented SQLite `synchronous` value. Same rationale as `parse_journal_mode`.
+fn parse_synchronous(v: &str) -> Result<String> {
+    let upper = v.to_ascii_uppercase();
+    match upper.as_str() {
+        "OFF" | "NORMAL" | "FULL" | "EXTRA" => Ok(upper),
+        _ => anyhow::bail!(
+            "unsupported SQLite synchronous mode {v:?}; expected one of OFF, NORMAL, FULL, EXTRA"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +200,62 @@ mod tests {
             assert!(
                 msg.contains("DMMCP_HTTP_PORT"),
                 "error should name the offending var: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn journal_mode_is_normalised_to_uppercase() {
+        with_clean_env(|| {
+            // SAFETY: env_lock is held.
+            unsafe { env::set_var("DMMCP_DB_JOURNAL_MODE", "wal") };
+            let cfg = Config::from_env().expect("mixed-case WAL should be accepted");
+            assert_eq!(cfg.db.journal_mode, "WAL");
+        });
+    }
+
+    #[test]
+    fn journal_mode_rejects_garbage() {
+        with_clean_env(|| {
+            // SAFETY: env_lock is held.
+            unsafe { env::set_var("DMMCP_DB_JOURNAL_MODE", "garbage") };
+            let err = Config::from_env().expect_err("should fail on unknown journal mode");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("DMMCP_DB_JOURNAL_MODE"),
+                "error should name the offending var: {msg}"
+            );
+            assert!(
+                msg.contains("garbage"),
+                "error should include the offending value: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn synchronous_is_normalised_to_uppercase() {
+        with_clean_env(|| {
+            // SAFETY: env_lock is held.
+            unsafe { env::set_var("DMMCP_DB_SYNCHRONOUS", "full") };
+            let cfg = Config::from_env().expect("mixed-case FULL should be accepted");
+            assert_eq!(cfg.db.synchronous, "FULL");
+        });
+    }
+
+    #[test]
+    fn synchronous_rejects_garbage() {
+        with_clean_env(|| {
+            // SAFETY: env_lock is held.
+            unsafe { env::set_var("DMMCP_DB_SYNCHRONOUS", "loose") };
+            let err = Config::from_env().expect_err("should fail on unknown synchronous mode");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("DMMCP_DB_SYNCHRONOUS"),
+                "error should name the offending var: {msg}"
+            );
+            assert!(
+                msg.contains("loose"),
+                "error should include the offending value: {msg}"
             );
         });
     }

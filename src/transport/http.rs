@@ -53,10 +53,7 @@ pub async fn run(cfg: &HttpConfig) -> Result<()> {
 
     let shutdown_cancel = cancel.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(_) => tracing::info!("shutdown signal received"),
-            Err(e) => tracing::warn!(error = %e, "failed to install shutdown handler"),
-        }
+        wait_for_shutdown().await;
         shutdown_cancel.cancel();
     });
 
@@ -68,4 +65,46 @@ pub async fn run(cfg: &HttpConfig) -> Result<()> {
 /// the SQLite connection is reachable before reporting healthy.
 async fn healthz(State(_): State<HealthState>) -> (StatusCode, &'static str) {
     (StatusCode::OK, "ok")
+}
+
+/// Wait for a shutdown signal. On Unix hosts we listen for both SIGINT (local development /
+/// Ctrl-C) and SIGTERM (Kubernetes pod termination) so `terminationGracePeriodSeconds` is
+/// respected and in-flight MCP sessions are cancelled via the shared `CancellationToken`
+/// instead of lingering until SIGKILL.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                // Falling back to ctrl_c is strictly worse for K8s, but never installing a
+                // handler is worse still — we'd block the task forever.
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; falling back to SIGINT only");
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(error = %e, "failed to await SIGINT");
+                }
+                return;
+            }
+        };
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => {
+                match r {
+                    Ok(()) => tracing::info!("SIGINT received; starting graceful shutdown"),
+                    Err(e) => tracing::warn!(error = %e, "SIGINT handler errored; starting shutdown anyway"),
+                }
+            }
+            _ = term.recv() => {
+                tracing::info!("SIGTERM received; starting graceful shutdown");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "failed to await ctrl_c");
+            return;
+        }
+        tracing::info!("shutdown signal received; starting graceful shutdown");
+    }
 }

@@ -41,16 +41,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
+      # Cache the registry AND ~/.cargo/bin so cargo-audit doesn't recompile every run.
+      # On self-hosted runners a cold cargo-audit build is ~30 minutes; this cuts that to
+      # a restore + lockfile diff on warm cache hits.
+      - name: Cache cargo registry + installed binaries
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-cargo-audit-
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        # Skip the compile if the cached binary is already present on PATH.
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
 
       - name: Run cargo audit
         run: cargo audit
