@@ -1,0 +1,19 @@
+target
+.git
+.github
+.claude
+.pids
+.logs
+
+# Local campaign DB + WAL sidecars from `make dev`
+campaign.db
+campaign.db-wal
+campaign.db-shm
+
+# Not needed for the build
+docs
+examples
+tests
+*.md
+Makefile
+LICENSE
