@@ -71,7 +71,7 @@ impl Config {
                 bind: env_or("DMMCP_HTTP_BIND", IpAddr::from([0, 0, 0, 0]), parse_str)?,
                 port: env_or("DMMCP_HTTP_PORT", 3000_u16, parse_str)?,
             },
-            log_level: env_or("DMMCP_LOG_LEVEL", "info".to_string(), |v| Ok(v.to_string()))?,
+            log_level: env_or("DMMCP_LOG_LEVEL", "info".to_string(), parse_log_level)?,
             content_dir: match env::var("DMMCP_CONTENT_DIR") {
                 Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
                 _ => None,
@@ -93,6 +93,31 @@ where
 {
     v.parse::<T>()
         .map_err(|e| anyhow::anyhow!("parse error: {e}"))
+}
+
+/// Validate a tracing filter directive (e.g. `info`, `debug`, `dm_mcp=trace,warn`).
+///
+/// `EnvFilter::try_new` alone is too permissive — it accepts a typoed level like
+/// `warng` as if it were a target name with no level (silently degrading to the
+/// default). To catch the common operator-typo case we additionally enforce:
+/// any single bare word (no `=` or `,`) must be one of the documented level names.
+/// More structured directives still go through `EnvFilter::try_new` for full syntax
+/// validation.
+fn parse_log_level(v: &str) -> Result<String> {
+    const LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "off"];
+    let trimmed = v.trim();
+    if !trimmed.contains('=') && !trimmed.contains(',') {
+        if !LEVELS.contains(&trimmed.to_ascii_lowercase().as_str()) {
+            anyhow::bail!(
+                "unknown level {trimmed:?}; expected one of {LEVELS:?} or a per-target \
+                 directive like `dm_mcp=debug,warn`"
+            );
+        }
+        return Ok(trimmed.to_ascii_lowercase());
+    }
+    tracing_subscriber::EnvFilter::try_new(trimmed)
+        .map_err(|e| anyhow::anyhow!("invalid tracing filter directive: {e}"))?;
+    Ok(trimmed.to_string())
 }
 
 /// Accept any documented SQLite `journal_mode` value. Normalise to uppercase so the PRAGMA
@@ -255,6 +280,44 @@ mod tests {
             );
             assert!(
                 msg.contains("loose"),
+                "error should include the offending value: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn log_level_accepts_simple_directive() {
+        with_clean_env(|| {
+            // SAFETY: env_lock is held.
+            unsafe { env::set_var("DMMCP_LOG_LEVEL", "warn") };
+            let cfg = Config::from_env().expect("simple directive should parse");
+            assert_eq!(cfg.log_level, "warn");
+        });
+    }
+
+    #[test]
+    fn log_level_accepts_per_target_directive() {
+        with_clean_env(|| {
+            // SAFETY: env_lock is held.
+            unsafe { env::set_var("DMMCP_LOG_LEVEL", "dm_mcp=trace,warn") };
+            let cfg = Config::from_env().expect("per-target directive should parse");
+            assert_eq!(cfg.log_level, "dm_mcp=trace,warn");
+        });
+    }
+
+    #[test]
+    fn log_level_rejects_garbage() {
+        with_clean_env(|| {
+            // SAFETY: env_lock is held.
+            unsafe { env::set_var("DMMCP_LOG_LEVEL", "warng") };
+            let err = Config::from_env().expect_err("should fail on misspelled level");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("DMMCP_LOG_LEVEL"),
+                "error should name the offending var: {msg}"
+            );
+            assert!(
+                msg.contains("warng"),
                 "error should include the offending value: {msg}"
             );
         });
