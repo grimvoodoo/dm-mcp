@@ -273,6 +273,80 @@ async fn ideology_alignment_modifier_threads_through_event_payload() -> Result<(
     Ok(())
 }
 
+// ── Regression test for issue #17 (effect source attribution in breakdown) ──
+
+#[tokio::test]
+async fn ability_targeting_effects_appear_in_resolve_check_breakdown() -> Result<()> {
+    // Pre-fix, an ability-targeting effect (e.g. potion:giant-strength → +2 str_score)
+    // got silently composed into the `effective_str` value behind the ability:str
+    // breakdown line. The DM agent could see the score had jumped from 12 → 14 but
+    // not WHY — no `effect:<source>` entry made it into the response. After the fix,
+    // every ability-targeting effect with non-zero modifier emits its own
+    // `effect:ability:<source>` line so the agent can attribute the change.
+    let h = connect().await?;
+    let cid = make_character(&h.client, "Brennan").await?;
+    // make_character builds a STR 14 ranger; bump to a known starting point of 12 by
+    // re-creating instead. Simpler: just use the existing 14 and apply +2 → effective 16.
+    call(
+        &h.client,
+        "apply_effect",
+        serde_json::json!({
+            "target_character_id": cid,
+            "source": "potion:giant-strength",
+            "target_kind": "ability",
+            "target_key": "str_score",
+            "modifier": 2
+        }),
+    )
+    .await?;
+
+    let result = call(
+        &h.client,
+        "resolve_check",
+        serde_json::json!({
+            "character_id": cid,
+            "kind": "ability_check",
+            "target_key": "str"
+        }),
+    )
+    .await?;
+
+    let breakdown = result["breakdown"].as_array().context("breakdown")?;
+
+    // The existing ability:str line should still be present and report the composed
+    // effective score (14 base + 2 from potion = 16).
+    let ability_line = breakdown
+        .iter()
+        .find(|b| b["kind"] == "ability:str")
+        .context("breakdown should still include ability:str")?;
+    assert!(
+        ability_line["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("effective STR score 16"),
+        "ability line should report the composed score 16; got {ability_line:?}"
+    );
+
+    // The new effect attribution line.
+    let effect_line = breakdown
+        .iter()
+        .find(|b| b["kind"] == "effect:ability:potion:giant-strength")
+        .context("breakdown should now include effect:ability:potion:giant-strength")?;
+    assert_eq!(
+        effect_line["value"].as_i64(),
+        Some(2),
+        "effect line value should be the raw modifier; got {effect_line:?}"
+    );
+    let reason = effect_line["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("potion:giant-strength") && reason.contains("STR"),
+        "effect line reason should name the source and the ability; got {effect_line:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
 // ── Sanity: tools listed ──────────────────────────────────────────────────────
 
 #[tokio::test]

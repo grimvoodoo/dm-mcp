@@ -181,7 +181,23 @@ fn resolve_ability(
     }
 }
 
-fn effective_ability_score(conn: &Connection, character_id: i64, ability: &str) -> Result<i32> {
+/// Per-effect contribution to a composed ability score. Surfaces the `source` so the
+/// breakdown can attribute the change rather than just showing the post-composition
+/// effective score in the `ability:<x>` line.
+#[derive(Debug, Clone)]
+struct AbilityEffectContribution {
+    source: String,
+    modifier: i32,
+}
+
+/// Compose an ability score: base from the character row + every active effect targeting
+/// that ability column. Returns the composed score and the list of contributing effects
+/// (so the caller can itemise them on the breakdown — see issue #17).
+fn effective_ability_score(
+    conn: &Connection,
+    character_id: i64,
+    ability: &str,
+) -> Result<(i32, Vec<AbilityEffectContribution>)> {
     let col = match ability {
         "str" => "str_score",
         "dex" => "dex_score",
@@ -198,15 +214,21 @@ fn effective_ability_score(conn: &Connection, character_id: i64, ability: &str) 
             |row| row.get(0),
         )
         .with_context(|| format!("read {col} for character {character_id}"))?;
-    let modifier_sum: i32 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(modifier), 0) FROM effects
-             WHERE target_character_id = ?1 AND active = 1 AND target_key = ?2",
-            rusqlite::params![character_id, col],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    Ok(base + modifier_sum)
+
+    let mut stmt = conn.prepare(
+        "SELECT source, modifier FROM effects
+         WHERE target_character_id = ?1 AND active = 1 AND target_key = ?2",
+    )?;
+    let contributions: Vec<AbilityEffectContribution> = stmt
+        .query_map(rusqlite::params![character_id, col], |row| {
+            Ok(AbilityEffectContribution {
+                source: row.get(0)?,
+                modifier: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let modifier_sum: i32 = contributions.iter().map(|c| c.modifier).sum();
+    Ok((base + modifier_sum, contributions))
 }
 
 fn ability_modifier(score: i32) -> i32 {
@@ -290,7 +312,8 @@ pub fn resolve(
     let kind = parse_kind(&p.kind)?;
 
     let ability = resolve_ability(content, kind, &p.target_key, p.ability.as_deref())?;
-    let effective_score = effective_ability_score(conn, p.character_id, &ability)?;
+    let (effective_score, ability_effect_contribs) =
+        effective_ability_score(conn, p.character_id, &ability)?;
     let ability_mod = ability_modifier(effective_score);
 
     // Proficiency row lookup. For skill_check/save/attack_roll we consult the
@@ -427,6 +450,27 @@ pub fn resolve(
             )),
         },
     ];
+
+    // Itemise every active effect that contributed to the composed ability score
+    // (issue #17). Distinct kind prefix `effect:ability:` so a consumer can tell these
+    // annotation entries apart from `effect:<source>` entries (which contribute to the
+    // total via effect_flat_sum). The ability:<x> line above already accounts for the
+    // composed mod — these per-effect lines exist purely to attribute the source.
+    for c in &ability_effect_contribs {
+        if c.modifier != 0 {
+            breakdown.push(BreakdownEntry {
+                kind: format!("effect:ability:{}", c.source),
+                value: c.modifier,
+                reason: Some(format!(
+                    "{source} → {modifier:+} {ability_up} (folded into effective score above)",
+                    source = c.source,
+                    modifier = c.modifier,
+                    ability_up = ability.to_ascii_uppercase(),
+                )),
+            });
+        }
+    }
+
     if prof_contrib != 0 || ranks != 0 || prof.is_some() {
         breakdown.push(BreakdownEntry {
             kind: "proficiency".into(),
