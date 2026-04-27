@@ -206,12 +206,13 @@ pub fn generate(
         })
         .collect();
 
-    // Prepare reconciliation substitutions: for slots we can satisfy without touching the
-    // DB, do them here. Everything else stays as ${slot} so the DM agent sees the raw
-    // placeholder.
+    // Substitute every ${slot} the archetype can satisfy from its slot_pools (and the
+    // engine-reserved ${years_ago}). Slots without a pool entry stay raw for the DM
+    // agent — Content::validate enforces full coverage of declared backstory_hooks at
+    // load time, so this is only relevant for forward-compat slots.
     let hook_texts: Vec<String> = chosen_hooks
         .iter()
-        .map(|h| minimal_slot_substitute(h, &mut rng))
+        .map(|h| substitute_slots(h, &arch.slot_pools, &mut rng))
         .collect();
 
     let species_label = arch.species.clone();
@@ -530,11 +531,46 @@ fn pick_many<R: Rng + ?Sized>(rng: &mut R, pool: &[String], n: usize) -> Vec<Str
     shuffled.into_iter().take(n).collect()
 }
 
-/// Replace `${years_ago}` with a concrete integer; leave every other `${slot}` verbatim
-/// so a later reconciliation pass (or the DM agent) can bind it to concrete entities.
-fn minimal_slot_substitute<R: Rng + ?Sized>(template: &str, rng: &mut R) -> String {
-    let years = rng.random_range(1..=50i32);
-    template.replace("${years_ago}", &years.to_string())
+/// Substitute `${slot}` placeholders in a backstory hook template.
+///
+/// - `${years_ago}` (reserved, see [`crate::content::RESERVED_SLOT_YEARS_AGO`]) is
+///   replaced with a random integer 1..=50.
+/// - Any other `${name}` is looked up in `slot_pools[name]`; if present and non-empty,
+///   replaced with one randomly picked entry. Missing pool means the slot is left
+///   verbatim so a later reconciliation pass (or the DM agent) can bind it.
+///
+/// Uses [`crate::content::next_slot`] as the shared scanner — `${...}` syntax stays
+/// in lockstep with the validation pass that enforces pool coverage at load time.
+/// An unterminated `${...` tail is preserved verbatim by the implicit tail copy at
+/// the end (`next_slot` returns `None`, the remaining bytes flow through unchanged).
+///
+/// `Content::validate` enforces that every slot referenced in `backstory_hooks`
+/// (other than `${years_ago}`) has a pool entry, so in normal use the verbatim
+/// fallback only fires for forward-compat slots an author hasn't pooled yet.
+fn substitute_slots<R: Rng + ?Sized>(
+    template: &str,
+    slot_pools: &std::collections::BTreeMap<String, Vec<String>>,
+    rng: &mut R,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut from = 0;
+    while let Some((range, name)) = crate::content::next_slot(template, from) {
+        out.push_str(&template[from..range.start]);
+        if name == crate::content::RESERVED_SLOT_YEARS_AGO {
+            let years = rng.random_range(1..=50i32);
+            out.push_str(&years.to_string());
+        } else if let Some(pool) = slot_pools.get(name).filter(|v| !v.is_empty()) {
+            out.push_str(&pool[rng.random_range(0..pool.len())]);
+        } else {
+            // No pool for this slot — emit verbatim so the DM agent (or a later
+            // reconciliation pass) can bind it. Validation prevents this from
+            // happening today for any declared backstory_hook.
+            out.push_str(&template[range.clone()]);
+        }
+        from = range.end;
+    }
+    out.push_str(&template[from..]);
+    out
 }
 
 #[allow(clippy::too_many_arguments)]

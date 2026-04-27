@@ -159,6 +159,14 @@ pub struct Archetype {
     pub hostile_triggers: Vec<String>,
     #[serde(default)]
     pub peace_hooks: Vec<String>,
+    /// Per-archetype substitution table for `${slot}` placeholders in `backstory_hooks`.
+    /// At generation time, each `${name}` in a chosen hook is replaced with one randomly
+    /// picked entry from `slot_pools[name]`. The reserved slot `${years_ago}` is auto-
+    /// filled with a random integer 1..=50 by the engine and does not need a pool.
+    /// Slots without a pool are left as `${slot}` so the DM agent (or a future
+    /// reconciliation pass) can bind them to concrete entities.
+    #[serde(default)]
+    pub slot_pools: BTreeMap<String, Vec<String>>,
     /// Catch-all for forward-compat / agent-readable fields not yet mechanised.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, serde_yaml_ng::Value>,
@@ -493,6 +501,30 @@ impl Content {
             }
         }
 
+        // Every ${slot} placeholder in a backstory_hook must have a matching entry in
+        // slot_pools (or be the engine-reserved ${years_ago}). Without this check,
+        // npc.generate's substitute_slots leaves unknown slots verbatim — leaking raw
+        // template strings like "${enemy_archetype}" into history events that the DM
+        // agent then has no way to render naturally.
+        const RESERVED_SLOTS: &[&str] = &[RESERVED_SLOT_YEARS_AGO];
+        for (arch_id, arch) in &self.archetypes {
+            for hook in &arch.backstory_hooks {
+                for slot in extract_slots(hook) {
+                    if RESERVED_SLOTS.contains(&slot.as_str()) {
+                        continue;
+                    }
+                    let pool_present = arch.slot_pools.get(&slot).is_some_and(|v| !v.is_empty());
+                    if !pool_present {
+                        anyhow::bail!(
+                            "archetype {arch_id:?} backstory hook references slot \
+                             ${{{slot}}} but slot_pools.{slot} is missing or empty; \
+                             add a pool entry or remove the slot from the hook"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -584,6 +616,45 @@ impl Content {
             _ => false,
         }
     }
+}
+
+/// Reserved slot name: the engine substitutes `${years_ago}` with a random integer
+/// 1..=50 at npc.generate time and skips it during validation. Defined here as the
+/// single source of truth so npcs::substitute_slots and content::validate can never
+/// drift on what counts as engine-reserved.
+pub(crate) const RESERVED_SLOT_YEARS_AGO: &str = "years_ago";
+
+/// Find the next `${slot}` placeholder in `template`, starting at byte offset `from`.
+/// Returns the byte range of the entire `${slot}` literal (inclusive of the leading
+/// `$` and the trailing `}`) and the slot name. `None` if no fully-closed `${slot}`
+/// remains; an unterminated `${...` tail is treated as no match (callers preserve or
+/// drop the tail however they like — the scanner itself doesn't care).
+///
+/// Both `content::extract_slots` (validation) and `npcs::substitute_slots` use this
+/// primitive, so any future change to placeholder syntax lands in one place.
+pub(crate) fn next_slot(template: &str, from: usize) -> Option<(std::ops::Range<usize>, &str)> {
+    let rest = template.get(from..)?;
+    let dollar = rest.find("${")?;
+    let name_start_in_rest = dollar + 2;
+    let after_open = rest.get(name_start_in_rest..)?;
+    let close = after_open.find('}')?;
+    let name = &after_open[..close];
+    let abs_start = from + dollar;
+    let abs_end = from + name_start_in_rest + close + 1; // include the `}`
+    Some((abs_start..abs_end, name))
+}
+
+/// Pull every `${slot}` placeholder name out of a template string. Used by validation
+/// (cross-checking that backstory_hook slots have matching slot_pools entries).
+/// Tolerates malformed `${...` (no closing brace) by ignoring the unterminated tail.
+fn extract_slots(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some((range, name)) = next_slot(template, from) {
+        out.push(name.to_string());
+        from = range.end;
+    }
+    out
 }
 
 fn parse_roll_modifier(v: &serde_yaml_ng::Value) -> Option<RollModifier> {
@@ -820,6 +891,7 @@ mod tests {
                         backstory_hooks: vec![],
                         hostile_triggers: vec![],
                         peace_hooks: vec![],
+                        slot_pools: BTreeMap::new(),
                         extra: BTreeMap::new(),
                     },
                 );
@@ -843,6 +915,81 @@ mod tests {
             msg.contains("phantom_sword") && msg.contains("unknown item base"),
             "error should name the offending base and what's wrong: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_archetype_with_uncovered_backstory_slot() {
+        // Regression for issue #19: a backstory_hook referencing a ${slot} with no
+        // matching slot_pools entry used to leak the raw placeholder into history
+        // events. Validation now refuses to load such an archetype at startup.
+        let mut bad_archetypes = BTreeMap::new();
+        bad_archetypes.insert(
+            "leaky".into(),
+            Archetype {
+                id: "leaky".into(),
+                species: "human".into(),
+                role_hint: "neutral".into(),
+                typical_age_years: None,
+                stats: BTreeMap::new(),
+                hp_formula: None,
+                ac_base: None,
+                speed_ft: None,
+                proficiencies: vec![],
+                loadout: vec![],
+                plan_pool: vec![],
+                ideology_pool: vec![],
+                backstory_hooks: vec!["Was once ${some_role} in ${some_place}".into()],
+                hostile_triggers: vec![],
+                peace_hooks: vec![],
+                // Pool only covers some_role; some_place is missing.
+                slot_pools: {
+                    let mut m = BTreeMap::new();
+                    m.insert("some_role".into(), vec!["a tax-collector".into()]);
+                    m
+                },
+                extra: BTreeMap::new(),
+            },
+        );
+        let content = Content {
+            abilities: vec![],
+            skills: vec![],
+            damage_types: vec![],
+            conditions: BTreeMap::new(),
+            biomes: BTreeMap::new(),
+            weapons: BTreeMap::new(),
+            enchantments: BTreeMap::new(),
+            archetypes: bad_archetypes,
+            name_pools: BTreeMap::new(),
+            setup_questions: vec![],
+            death_events: vec![],
+            item_bases: BTreeMap::new(),
+            encumbrance: EncumbranceRules {
+                capacity_per_str: 15,
+                encumbered_threshold_pct: 67,
+                overloaded_threshold_pct: 100,
+            },
+        };
+        let err = content
+            .validate()
+            .expect_err("should reject archetype with uncovered backstory slot");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("some_place") && msg.contains("slot_pools"),
+            "error should name the offending slot and what's missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_slots_pulls_names_and_skips_unterminated() {
+        // Standalone unit test for the helper used by validate. Single ${a} → ["a"].
+        // Multiple ${a} ${b} → ["a", "b"]. Unterminated `${trailing` is skipped.
+        assert_eq!(extract_slots("hello ${name}"), vec!["name".to_string()]);
+        assert_eq!(
+            extract_slots("${a} and ${b}"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(extract_slots("no slots here").is_empty());
+        assert!(extract_slots("${unterminated").is_empty());
     }
 
     #[test]

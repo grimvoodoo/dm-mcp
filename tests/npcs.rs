@@ -306,6 +306,62 @@ async fn orc_raider_loadout_items_have_real_stats_not_zero() -> Result<()> {
 }
 
 #[tokio::test]
+async fn backstory_summaries_have_no_unresolved_placeholders() -> Result<()> {
+    // Regression for issue #19: orc_raider backstory summaries used to leak raw
+    // template strings like "Killed ${enemy_archetype} in single combat over ${cause}"
+    // into history events. After the fix, every ${slot} in a backstory_hook is bound
+    // to a value from the archetype's slot_pools (or to a random integer for the
+    // engine-reserved ${years_ago}); Content::validate refuses to load if any slot
+    // is uncovered.
+    let h = connect().await?;
+    let zone_id = setup_world(&h.client).await?;
+
+    // A few orcs to sample multiple hook draws — npc.generate picks 3-5 hooks per NPC.
+    let mut summaries: Vec<String> = Vec::new();
+    for _ in 0..5 {
+        let gen = call(
+            &h.client,
+            "npc.generate",
+            serde_json::json!({ "archetype": "orc_raider", "zone_id": zone_id }),
+        )
+        .await?;
+        let orc_id = gen["character_id"].as_i64().unwrap();
+        let recalled = call(
+            &h.client,
+            "character.recall",
+            serde_json::json!({
+                "character_id": orc_id,
+                "kind_prefix": "history.",
+                "since_hour": -1_000_000_i64
+            }),
+        )
+        .await?;
+        for ev in recalled["events"].as_array().unwrap() {
+            summaries.push(
+                ev["summary"]
+                    .as_str()
+                    .expect("summary should be a string")
+                    .to_string(),
+            );
+        }
+    }
+
+    assert!(
+        !summaries.is_empty(),
+        "5 orcs × 3-5 hooks each should produce ≥1 backstory event"
+    );
+    for s in &summaries {
+        assert!(
+            !s.contains("${"),
+            "backstory summary should have no unresolved ${{slot}} placeholders; got: {s:?}"
+        );
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn recall_filters_by_kind_prefix_and_since_hour() -> Result<()> {
     let h = connect().await?;
     setup_world(&h.client).await?;
