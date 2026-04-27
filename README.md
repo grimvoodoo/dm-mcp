@@ -77,6 +77,16 @@ cargo build --release
 
 Pure Rust, rustls-only TLS — the release binary is statically linked and ships into a `scratch` container with no system dependencies.
 
+## Development setup
+
+Enable the Trivy secret-scan pre-commit hook (one-time per clone):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook (`.githooks/pre-commit`) runs `trivy fs --scanners secret` against the staged content before each commit and blocks the commit if it finds a leak. It requires `trivy` on `PATH`; install from <https://trivy.dev/latest/getting-started/installation/> or grab a binary from the [releases page](https://github.com/aquasecurity/trivy/releases). The same scan also runs in CI (`.github/workflows/secret-scan.yaml`) on every push and PR, so an accidental bypass still surfaces in time to rotate the credential.
+
 ## Run
 
 ```bash
