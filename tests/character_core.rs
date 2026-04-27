@@ -280,6 +280,72 @@ async fn change_role_flips_role_and_logs_event() -> Result<()> {
 }
 
 #[tokio::test]
+async fn effects_stack_additively_on_same_target() -> Result<()> {
+    // Two effects both targeting str_score should compose at read time:
+    // effective_str = base + sum(modifiers).
+    let h = connect().await?;
+    let cr = call(
+        &h.client,
+        "character.create",
+        serde_json::json!({
+            "name": "Stacker",
+            "role": "player",
+            "str_score": 12, "dex_score": 10, "con_score": 10,
+            "int_score": 10, "wis_score": 10, "cha_score": 10
+        }),
+    )
+    .await?;
+    let cid = cr["character_id"].as_i64().unwrap();
+
+    call(
+        &h.client,
+        "apply_effect",
+        serde_json::json!({
+            "target_character_id": cid,
+            "source": "spell:bull-strength",
+            "target_kind": "ability",
+            "target_key": "str_score",
+            "modifier": 2
+        }),
+    )
+    .await?;
+    call(
+        &h.client,
+        "apply_effect",
+        serde_json::json!({
+            "target_character_id": cid,
+            "source": "rage",
+            "target_kind": "ability",
+            "target_key": "str_score",
+            "modifier": 1
+        }),
+    )
+    .await?;
+
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": cid }),
+    )
+    .await?;
+    assert_eq!(view["str_score"].as_i64(), Some(12), "base unchanged");
+    assert_eq!(
+        view["effective_str"].as_i64(),
+        Some(15),
+        "effective = 12 + 2 + 1; view = {view:#?}"
+    );
+    let effects = view["active_effects"].as_array().unwrap();
+    assert_eq!(
+        effects.len(),
+        2,
+        "both effects should be active; got {effects:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn proficiency_and_resource_crud() -> Result<()> {
     let h = connect().await?;
     let create_result = call(

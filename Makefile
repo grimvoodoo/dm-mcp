@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Runtime config (mirrors the DMMCP_ env var contract; see README) ──────────
-HTTP_BIND   := 127.0.0.1
+HTTP_BIND   := 0.0.0.0
 HTTP_PORT   := 3000
 DB_PATH     := ./campaign.db
 LOG_LEVEL   := info

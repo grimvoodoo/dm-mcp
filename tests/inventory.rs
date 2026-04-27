@@ -513,3 +513,251 @@ async fn equip_and_inspect_round_trip() -> Result<()> {
     let _ = Connection::open_in_memory(); // silence unused import
     Ok(())
 }
+
+// ── E2E 5: barter auto-accept above 90% (no check rolled) ──────────────────
+
+#[tokio::test]
+async fn barter_auto_accepts_when_offer_exceeds_90pct() -> Result<()> {
+    let h = connect().await?;
+    let pc = make_char(&h.client, "Buyer", 10, 10, None).await?;
+    let merchant = make_char(&h.client, "Merchant", 10, 10, None).await?;
+
+    // Player offers 25 gold (25 gp) for a longsword (15 gp) — 167% of asking.
+    let player_gold = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({
+            "base_kind": "gold",
+            "holder_character_id": pc,
+            "quantity": 25
+        }),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+    let merchant_sword = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({
+            "base_kind": "longsword",
+            "holder_character_id": merchant
+        }),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+
+    let r = call(
+        &h.client,
+        "barter.exchange",
+        serde_json::json!({
+            "character_id": pc,
+            "merchant_character_id": merchant,
+            "offered_item_ids": [player_gold],
+            "requested_item_ids": [merchant_sword]
+        }),
+    )
+    .await?;
+    assert_eq!(r["resolution"].as_str(), Some("auto_accept"));
+    assert_eq!(r["outcome"].as_str(), Some("accepted"));
+    assert!(
+        r.get("check_dc").is_none() || r["check_dc"].is_null(),
+        "auto-accept should not roll a persuasion check; got {r:?}"
+    );
+
+    // Sword now on the player.
+    let view = call(
+        &h.client,
+        "inventory.get",
+        serde_json::json!({ "character_id": pc }),
+    )
+    .await?;
+    let items = view["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|it| it["id"].as_i64() == Some(merchant_sword)),
+        "auto-accepted barter should deposit sword on player; got {items:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+// ── E2E 6: barter refuses below 50% (no check rolled) ──────────────────────
+
+#[tokio::test]
+async fn barter_refuses_when_offer_below_50pct() -> Result<()> {
+    let h = connect().await?;
+    let pc = make_char(&h.client, "Buyer", 10, 10, None).await?;
+    let merchant = make_char(&h.client, "Merchant", 10, 10, None).await?;
+
+    // Player offers 1 gold for a longsword (15 gp) — 7% of asking.
+    let player_gold = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({
+            "base_kind": "gold",
+            "holder_character_id": pc,
+            "quantity": 1
+        }),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+    let merchant_sword = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({
+            "base_kind": "longsword",
+            "holder_character_id": merchant
+        }),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+
+    let r = call(
+        &h.client,
+        "barter.exchange",
+        serde_json::json!({
+            "character_id": pc,
+            "merchant_character_id": merchant,
+            "offered_item_ids": [player_gold],
+            "requested_item_ids": [merchant_sword]
+        }),
+    )
+    .await?;
+    assert_eq!(r["resolution"].as_str(), Some("refused"));
+    assert_eq!(r["outcome"].as_str(), Some("declined"));
+
+    // Sword stays on the merchant.
+    let view = call(
+        &h.client,
+        "inventory.get",
+        serde_json::json!({ "character_id": merchant }),
+    )
+    .await?;
+    let items = view["items"].as_array().unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|it| it["id"].as_i64() == Some(merchant_sword)),
+        "refused barter must leave sword with merchant; got {items:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+// ── E2E 7: inventory.transfer between characters ───────────────────────────
+
+#[tokio::test]
+async fn transfer_moves_item_between_holders() -> Result<()> {
+    let h = connect().await?;
+    let alice = make_char(&h.client, "Alice", 10, 10, None).await?;
+    let bob = make_char(&h.client, "Bob", 10, 10, None).await?;
+
+    let item = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({
+            "base_kind": "longsword",
+            "holder_character_id": alice
+        }),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+
+    // Pre-state: alice has it, bob doesn't.
+    let av = call(
+        &h.client,
+        "inventory.get",
+        serde_json::json!({ "character_id": alice }),
+    )
+    .await?;
+    assert!(av["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|it| it["id"].as_i64() == Some(item)));
+
+    // Transfer.
+    call(
+        &h.client,
+        "inventory.transfer",
+        serde_json::json!({
+            "item_id": item,
+            "to_character_id": bob
+        }),
+    )
+    .await?;
+
+    // Post-state: alice doesn't, bob does.
+    let av = call(
+        &h.client,
+        "inventory.get",
+        serde_json::json!({ "character_id": alice }),
+    )
+    .await?;
+    assert!(
+        !av["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|it| it["id"].as_i64() == Some(item)),
+        "after transfer, item should be off alice; got {av:?}"
+    );
+    let bv = call(
+        &h.client,
+        "inventory.get",
+        serde_json::json!({ "character_id": bob }),
+    )
+    .await?;
+    assert!(
+        bv["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|it| it["id"].as_i64() == Some(item)),
+        "after transfer, item should be on bob; got {bv:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+// ── E2E 8: non-stackable base + quantity > 1 → tool error ──────────────────
+
+#[tokio::test]
+async fn non_stackable_create_with_quantity_errors() -> Result<()> {
+    use rmcp::model::CallToolRequestParams;
+
+    let h = connect().await?;
+    let pc = make_char(&h.client, "Owner", 10, 10, None).await?;
+
+    // `stone` is declared `stackable: false` in content/items/bases/general.yaml.
+    // Asking for quantity 3 must fail loudly rather than silently materializing.
+    let args = serde_json::json!({
+        "base_kind": "stone",
+        "holder_character_id": pc,
+        "quantity": 3
+    });
+    let params = CallToolRequestParams::new("inventory.create")
+        .with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(_) => { /* JSON-RPC error — fine */ }
+        Ok(result) => {
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "stone with quantity 3 should fail; got {result:?}"
+            );
+        }
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
