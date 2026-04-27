@@ -533,55 +533,43 @@ fn pick_many<R: Rng + ?Sized>(rng: &mut R, pool: &[String], n: usize) -> Vec<Str
 
 /// Substitute `${slot}` placeholders in a backstory hook template.
 ///
-/// - `${years_ago}` — reserved, replaced with a random integer 1..=50.
-/// - Any other `${name}` — looked up in `slot_pools[name]`; if present, replaced with
-///   one randomly picked entry. Missing pool means the slot is left verbatim so a
-///   later reconciliation pass (or the DM agent) can bind it.
+/// - `${years_ago}` (reserved, see [`crate::content::RESERVED_SLOT_YEARS_AGO`]) is
+///   replaced with a random integer 1..=50.
+/// - Any other `${name}` is looked up in `slot_pools[name]`; if present and non-empty,
+///   replaced with one randomly picked entry. Missing pool means the slot is left
+///   verbatim so a later reconciliation pass (or the DM agent) can bind it.
 ///
-/// `Content::validate` enforces that every slot referenced in `backstory_hooks` (other
-/// than `years_ago`) has a pool entry, so in normal use the verbatim fallback only
-/// fires for forward-compat slots an author hasn't pooled yet.
+/// Uses [`crate::content::next_slot`] as the shared scanner — `${...}` syntax stays
+/// in lockstep with the validation pass that enforces pool coverage at load time.
+/// An unterminated `${...` tail is preserved verbatim by the implicit tail copy at
+/// the end (`next_slot` returns `None`, the remaining bytes flow through unchanged).
+///
+/// `Content::validate` enforces that every slot referenced in `backstory_hooks`
+/// (other than `${years_ago}`) has a pool entry, so in normal use the verbatim
+/// fallback only fires for forward-compat slots an author hasn't pooled yet.
 fn substitute_slots<R: Rng + ?Sized>(
     template: &str,
     slot_pools: &std::collections::BTreeMap<String, Vec<String>>,
     rng: &mut R,
 ) -> String {
     let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '$' || chars.peek() != Some(&'{') {
-            out.push(c);
-            continue;
-        }
-        chars.next(); // consume '{'
-        let mut slot = String::new();
-        let mut closed = false;
-        while let Some(&nc) = chars.peek() {
-            if nc == '}' {
-                chars.next();
-                closed = true;
-                break;
-            }
-            slot.push(nc);
-            chars.next();
-        }
-        if !closed {
-            // Unterminated `${...` — emit the literal we consumed and stop scanning.
-            out.push_str("${");
-            out.push_str(&slot);
-            continue;
-        }
-        if slot == "years_ago" {
+    let mut from = 0;
+    while let Some((range, name)) = crate::content::next_slot(template, from) {
+        out.push_str(&template[from..range.start]);
+        if name == crate::content::RESERVED_SLOT_YEARS_AGO {
             let years = rng.random_range(1..=50i32);
             out.push_str(&years.to_string());
-        } else if let Some(pool) = slot_pools.get(&slot).filter(|v| !v.is_empty()) {
+        } else if let Some(pool) = slot_pools.get(name).filter(|v| !v.is_empty()) {
             out.push_str(&pool[rng.random_range(0..pool.len())]);
         } else {
-            out.push_str("${");
-            out.push_str(&slot);
-            out.push('}');
+            // No pool for this slot — emit verbatim so the DM agent (or a later
+            // reconciliation pass) can bind it. Validation prevents this from
+            // happening today for any declared backstory_hook.
+            out.push_str(&template[range.clone()]);
         }
+        from = range.end;
     }
+    out.push_str(&template[from..]);
     out
 }
 

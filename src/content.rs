@@ -506,7 +506,7 @@ impl Content {
         // npc.generate's substitute_slots leaves unknown slots verbatim — leaking raw
         // template strings like "${enemy_archetype}" into history events that the DM
         // agent then has no way to render naturally.
-        const RESERVED_SLOTS: &[&str] = &["years_ago"];
+        const RESERVED_SLOTS: &[&str] = &[RESERVED_SLOT_YEARS_AGO];
         for (arch_id, arch) in &self.archetypes {
             for hook in &arch.backstory_hooks {
                 for slot in extract_slots(hook) {
@@ -618,32 +618,41 @@ impl Content {
     }
 }
 
+/// Reserved slot name: the engine substitutes `${years_ago}` with a random integer
+/// 1..=50 at npc.generate time and skips it during validation. Defined here as the
+/// single source of truth so npcs::substitute_slots and content::validate can never
+/// drift on what counts as engine-reserved.
+pub(crate) const RESERVED_SLOT_YEARS_AGO: &str = "years_ago";
+
+/// Find the next `${slot}` placeholder in `template`, starting at byte offset `from`.
+/// Returns the byte range of the entire `${slot}` literal (inclusive of the leading
+/// `$` and the trailing `}`) and the slot name. `None` if no fully-closed `${slot}`
+/// remains; an unterminated `${...` tail is treated as no match (callers preserve or
+/// drop the tail however they like — the scanner itself doesn't care).
+///
+/// Both `content::extract_slots` (validation) and `npcs::substitute_slots` use this
+/// primitive, so any future change to placeholder syntax lands in one place.
+pub(crate) fn next_slot(template: &str, from: usize) -> Option<(std::ops::Range<usize>, &str)> {
+    let rest = template.get(from..)?;
+    let dollar = rest.find("${")?;
+    let name_start_in_rest = dollar + 2;
+    let after_open = rest.get(name_start_in_rest..)?;
+    let close = after_open.find('}')?;
+    let name = &after_open[..close];
+    let abs_start = from + dollar;
+    let abs_end = from + name_start_in_rest + close + 1; // include the `}`
+    Some((abs_start..abs_end, name))
+}
+
 /// Pull every `${slot}` placeholder name out of a template string. Used by validation
-/// (cross-checking that backstory_hook slots have matching slot_pools entries) and
-/// kept here next to the validate impl so both stay aligned. Tolerates malformed
-/// `${...` (no closing brace) by ignoring the unterminated tail.
+/// (cross-checking that backstory_hook slots have matching slot_pools entries).
+/// Tolerates malformed `${...` (no closing brace) by ignoring the unterminated tail.
 fn extract_slots(template: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '$' || chars.peek() != Some(&'{') {
-            continue;
-        }
-        chars.next(); // consume '{'
-        let mut slot = String::new();
-        let mut closed = false;
-        while let Some(&nc) = chars.peek() {
-            if nc == '}' {
-                chars.next();
-                closed = true;
-                break;
-            }
-            slot.push(nc);
-            chars.next();
-        }
-        if closed {
-            out.push(slot);
-        }
+    let mut from = 0;
+    while let Some((range, name)) = next_slot(template, from) {
+        out.push(name.to_string());
+        from = range.end;
     }
     out
 }
