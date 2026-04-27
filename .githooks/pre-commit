@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Pre-commit secret scan via Trivy. Blocks the commit if any staged file would
+# leak credentials, API keys, or other high-sensitivity strings.
+#
+# Enable per-clone with:
+#   git config core.hooksPath .githooks
+#
+# A matching CI job (.github/workflows/secret-scan.yaml) catches anything that
+# bypasses this hook (e.g. --no-verify, or a fresh clone without core.hooksPath
+# pointed here yet) so a leak still surfaces in the PR / push checks.
+
+set -euo pipefail
+
+if ! command -v trivy >/dev/null 2>&1; then
+    echo "pre-commit: trivy is not installed; cannot run the secret scan." >&2
+    echo "  Install: https://trivy.dev/latest/getting-started/installation/" >&2
+    echo "  Or download a binary from https://github.com/aquasecurity/trivy/releases" >&2
+    echo "  (no-soft-fail: hook fails closed so a missing scanner doesn't masquerade as a clean scan)" >&2
+    exit 1
+fi
+
+# List staged files: Added, Copied, Modified, Renamed. Skip Deleted (no content
+# to scan) and submodule changes. -z gives NUL-separated paths so spaces / odd
+# characters survive intact.
+staged_count=$(git diff --cached --name-only --diff-filter=ACMR -z | tr -cd '\0' | wc -c)
+if [ "$staged_count" = "0" ]; then
+    # Nothing relevant staged — let the commit proceed (e.g. amend with no changes).
+    exit 0
+fi
+
+# Materialise the indexed content into a temp dir. Using checkout-index instead
+# of just scanning the working tree means we scan exactly what's about to land
+# in the commit, ignoring any unstaged edits or untracked files.
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+git diff --cached --name-only --diff-filter=ACMR -z \
+    | git checkout-index -z --stdin --prefix="$tmpdir/"
+
+if ! trivy fs --scanners secret --exit-code 1 --quiet "$tmpdir"; then
+    echo >&2
+    echo "pre-commit: trivy detected secrets in staged content. Commit blocked." >&2
+    echo "Review the findings above. To override (last resort — the CI scan will" >&2
+    echo "still flag it), re-run with: git commit --no-verify" >&2
+    echo "False positive? Add an exception to .trivyignore and re-stage." >&2
+    exit 1
+fi
