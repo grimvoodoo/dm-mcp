@@ -452,3 +452,118 @@ async fn proficiency_and_resource_crud() -> Result<()> {
     h.client.cancel().await?;
     Ok(())
 }
+
+// ── Regression test for issue #18 (character.get truncates condition fields) ──
+
+#[tokio::test]
+async fn character_get_surfaces_full_condition_shape() -> Result<()> {
+    // Conditions are stored with optional fields (remove_on_save, expires_after_rounds,
+    // expires_at_hour, source_event_id). Pre-fix, character.get only returned id /
+    // condition / severity, making remove_on_save effectively write-only — the DM
+    // agent could apply a condition with a save-on-retry spec but never read the spec
+    // to know it existed.
+    //
+    // After the fix, every stored field appears on the response, mirroring how
+    // active_effects already exposes its full schema.
+    let h = connect().await?;
+    let cr = call(
+        &h.client,
+        "character.create",
+        serde_json::json!({
+            "name": "Hexed",
+            "role": "player",
+            "str_score": 10, "dex_score": 10, "con_score": 10,
+            "int_score": 10, "wis_score": 10, "cha_score": 10
+        }),
+    )
+    .await?;
+    let cid = cr["character_id"].as_i64().unwrap();
+
+    // (1) Apply with a remove_on_save spec and a non-default severity.
+    call(
+        &h.client,
+        "condition.apply",
+        serde_json::json!({
+            "character_id": cid,
+            "condition": "poisoned",
+            "severity": 1,
+            "remove_on_save": "save:con:dc15"
+        }),
+    )
+    .await?;
+
+    // (2) Apply with an expires_after_rounds countdown.
+    call(
+        &h.client,
+        "condition.apply",
+        serde_json::json!({
+            "character_id": cid,
+            "condition": "frightened",
+            "expires_after_rounds": 5
+        }),
+    )
+    .await?;
+
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": cid }),
+    )
+    .await?;
+    let conds = view["active_conditions"].as_array().unwrap();
+    assert_eq!(
+        conds.len(),
+        2,
+        "both conditions should be active; got {conds:?}"
+    );
+
+    let poisoned = conds
+        .iter()
+        .find(|c| c["condition"] == "poisoned")
+        .context("poisoned condition")?;
+    assert_eq!(
+        poisoned["remove_on_save"].as_str(),
+        Some("save:con:dc15"),
+        "remove_on_save must be surfaced on character.get; got {poisoned:?}"
+    );
+    // Optional time-bound fields not set on this condition must serialise as null
+    // (key present, value null), not be absent from the JSON.
+    for absent in ["expires_after_rounds", "expires_at_hour"] {
+        assert!(
+            poisoned.get(absent).is_some_and(serde_json::Value::is_null),
+            "{absent} should be present and null on poisoned; got {poisoned:?}"
+        );
+    }
+    // source_event_id is auto-populated with the condition.applied event id by the
+    // engine — it's the chain pointer back to "what caused this". Just assert it's
+    // a positive integer here; the exact value depends on event ordering in the run.
+    assert!(
+        poisoned["source_event_id"].as_i64().is_some_and(|v| v > 0),
+        "source_event_id should be the apply event's id; got {poisoned:?}"
+    );
+
+    let frightened = conds
+        .iter()
+        .find(|c| c["condition"] == "frightened")
+        .context("frightened condition")?;
+    assert_eq!(
+        frightened["expires_after_rounds"].as_i64(),
+        Some(5),
+        "expires_after_rounds must be surfaced; got {frightened:?}"
+    );
+    assert!(
+        frightened
+            .get("remove_on_save")
+            .is_some_and(serde_json::Value::is_null),
+        "remove_on_save should be present and null on frightened; got {frightened:?}"
+    );
+    assert!(
+        frightened
+            .get("expires_at_hour")
+            .is_some_and(serde_json::Value::is_null),
+        "expires_at_hour should be present and null on frightened; got {frightened:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
