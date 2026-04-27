@@ -11,3 +11,7 @@
 
 # Claude Code runtime state (scheduled tasks, session locks)
 /.claude/
+
+# Per-developer Claude Code MCP server registrations. May reference local URLs,
+# tokens, or environment-specific transport details that shouldn't be checked in.
+/.mcp.json

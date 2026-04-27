@@ -126,6 +126,44 @@ async fn make_encounter(
     Ok(r["encounter_id"].as_i64().unwrap())
 }
 
+/// Drop the character to 0 HP and roll death saves until they hit `status: "dead"`.
+/// Used by guard tests that need a dead victim to verify the dead-character refusal paths.
+async fn kill_character(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    character_id: i64,
+) -> Result<()> {
+    call(
+        client,
+        "combat.apply_damage",
+        serde_json::json!({ "character_id": character_id, "amount": 999 }),
+    )
+    .await?;
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        assert!(guard < 300, "never reached dead status; guard tripped");
+        let save = call(
+            client,
+            "roll_death_save",
+            serde_json::json!({ "character_id": character_id }),
+        )
+        .await?;
+        match save["status"].as_str() {
+            Some("dead") => return Ok(()),
+            Some("alive") => {
+                // Stabilised — knock them down again.
+                call(
+                    client,
+                    "combat.apply_damage",
+                    serde_json::json!({ "character_id": character_id, "amount": 999 }),
+                )
+                .await?;
+            }
+            _ => { /* still unconscious — keep rolling */ }
+        }
+    }
+}
+
 // ── E2E 1: round-based effect expiry ────────────────────────────────────────
 
 #[tokio::test]
@@ -480,6 +518,476 @@ async fn rests_refill_resources_and_heal() -> Result<()> {
     )
     .await?;
     assert_eq!(view["hp_current"].as_i64(), Some(20));
+    h.client.cancel().await?;
+    Ok(())
+}
+
+// ── Healing path: heal-above-zero clears mortally_wounded ──────────────────
+
+#[tokio::test]
+async fn healing_above_zero_clears_mortally_wounded() -> Result<()> {
+    let h = connect().await?;
+    let player = make_char(&h.client, "Kira", "player", 12).await?;
+
+    // Drop to 0 — auto-applies mortally_wounded + unconscious.
+    let r = call(
+        &h.client,
+        "combat.apply_damage",
+        serde_json::json!({ "character_id": player, "amount": 12 }),
+    )
+    .await?;
+    assert_eq!(r["status"].as_str(), Some("unconscious"));
+    let mw_id = r["mortally_wounded_condition_id"]
+        .as_i64()
+        .context("mortally_wounded_condition_id")?;
+
+    // Heal above 0 — must clear mortally_wounded.
+    let h_r = call(
+        &h.client,
+        "combat.apply_healing",
+        serde_json::json!({ "character_id": player, "amount": 5 }),
+    )
+    .await?;
+    assert_eq!(h_r["hp_current"].as_i64(), Some(5));
+    assert_eq!(h_r["status"].as_str(), Some("alive"));
+    assert_eq!(h_r["cleared_mortally_wounded"].as_bool(), Some(true));
+
+    // Cross-check via character.get: condition row no longer active.
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": player }),
+    )
+    .await?;
+    let conds = view["active_conditions"].as_array().unwrap();
+    assert!(
+        !conds.iter().any(|c| c["id"].as_i64() == Some(mw_id)),
+        "mortally_wounded should be cleared after heal-above-zero; got {conds:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+// ── Dead-character guards: heal / rest.long / roll_death_save all refuse ──
+
+#[tokio::test]
+async fn healing_dead_character_refused() -> Result<()> {
+    use rmcp::model::CallToolRequestParams;
+
+    let h = connect().await?;
+    let player = make_char(&h.client, "Doomed", "player", 5).await?;
+    kill_character(&h.client, player).await?;
+
+    let args = serde_json::json!({ "character_id": player, "amount": 10 });
+    let params = CallToolRequestParams::new("combat.apply_healing")
+        .with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(_) => { /* JSON-RPC error — fine */ }
+        Ok(result) => assert_eq!(
+            result.is_error,
+            Some(true),
+            "healing dead character must signal error; got {result:?}"
+        ),
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rest_long_refused_when_dead() -> Result<()> {
+    use rmcp::model::CallToolRequestParams;
+
+    let h = connect().await?;
+    let player = make_char(&h.client, "Doomed", "player", 5).await?;
+    kill_character(&h.client, player).await?;
+
+    let args = serde_json::json!({ "character_id": player });
+    let params =
+        CallToolRequestParams::new("rest.long").with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(_) => {}
+        Ok(result) => assert_eq!(
+            result.is_error,
+            Some(true),
+            "rest.long on dead character must signal error; got {result:?}"
+        ),
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn death_save_refused_when_dead() -> Result<()> {
+    use rmcp::model::CallToolRequestParams;
+
+    let h = connect().await?;
+    let player = make_char(&h.client, "Doomed", "player", 5).await?;
+    kill_character(&h.client, player).await?;
+
+    let args = serde_json::json!({ "character_id": player });
+    let params = CallToolRequestParams::new("roll_death_save")
+        .with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(_) => {}
+        Ok(result) => assert_eq!(
+            result.is_error,
+            Some(true),
+            "roll_death_save on dead character must signal error; got {result:?}"
+        ),
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+// ── Death save edge cases: nat-1 = 2 failures, nat-20 = auto-stabilise ─────
+
+#[tokio::test]
+async fn death_save_nat1_critical_fails_two_steps() -> Result<()> {
+    // Roll death saves on a fresh victim, re-dropping after stabilisation, until we land
+    // a nat-1 (`outcome: "critical_fail"`). Each nat-1 must:
+    //   - bump failures by exactly 2
+    //   - have d20 = 1
+    // Generates a new victim if the current one dies via plain failures.
+    let h = connect().await?;
+    let mut victim = make_char(&h.client, "Victim 0", "player", 10).await?;
+    call(
+        &h.client,
+        "combat.apply_damage",
+        serde_json::json!({ "character_id": victim, "amount": 30 }),
+    )
+    .await?;
+
+    let mut guard = 0;
+    let mut prev_failures = 0;
+    let mut victim_idx = 0;
+    let result = loop {
+        guard += 1;
+        assert!(guard < 500, "never observed a nat-1 in 500 rolls");
+        let save = call(
+            &h.client,
+            "roll_death_save",
+            serde_json::json!({ "character_id": victim }),
+        )
+        .await?;
+        if save["outcome"].as_str() == Some("critical_fail") {
+            break save;
+        }
+        match save["status"].as_str() {
+            Some("alive") => {
+                // Stabilised via 3 successes — re-drop.
+                call(
+                    &h.client,
+                    "combat.apply_damage",
+                    serde_json::json!({ "character_id": victim, "amount": 30 }),
+                )
+                .await?;
+                prev_failures = 0;
+            }
+            Some("dead") => {
+                // Died via plain fails before we got our nat-1 — fresh victim.
+                victim_idx += 1;
+                victim =
+                    make_char(&h.client, &format!("Victim {victim_idx}"), "player", 10).await?;
+                call(
+                    &h.client,
+                    "combat.apply_damage",
+                    serde_json::json!({ "character_id": victim, "amount": 30 }),
+                )
+                .await?;
+                prev_failures = 0;
+            }
+            _ => {
+                prev_failures = save["failures"].as_i64().unwrap();
+            }
+        }
+    };
+    assert_eq!(
+        result["d20"].as_i64(),
+        Some(1),
+        "critical_fail requires d20=1"
+    );
+    let now_failures = result["failures"].as_i64().unwrap();
+    assert_eq!(
+        now_failures,
+        (prev_failures + 2).min(3),
+        "nat-1 should bump failures by 2 (clamped to 3); was {prev_failures}, now {now_failures}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn death_save_nat20_auto_stabilises_at_one_hp() -> Result<()> {
+    // Roll death saves until a nat-20 fires. On nat-20:
+    //   - outcome = "auto_stabilise"
+    //   - status = "alive", hp_current = 1
+    //   - successes/failures both 0
+    //   - mortally_wounded condition cleared from active_conditions
+    let h = connect().await?;
+    let mut victim = make_char(&h.client, "Victim 0", "player", 10).await?;
+    call(
+        &h.client,
+        "combat.apply_damage",
+        serde_json::json!({ "character_id": victim, "amount": 30 }),
+    )
+    .await?;
+
+    let mut guard = 0;
+    let mut victim_idx = 0;
+    let result = loop {
+        guard += 1;
+        assert!(guard < 500, "never observed a nat-20 in 500 rolls");
+        let save = call(
+            &h.client,
+            "roll_death_save",
+            serde_json::json!({ "character_id": victim }),
+        )
+        .await?;
+        if save["outcome"].as_str() == Some("auto_stabilise") {
+            break save;
+        }
+        match save["status"].as_str() {
+            Some("alive") => {
+                // Stabilised via 3 successes (not via nat-20 since outcome differs) — re-drop.
+                call(
+                    &h.client,
+                    "combat.apply_damage",
+                    serde_json::json!({ "character_id": victim, "amount": 30 }),
+                )
+                .await?;
+            }
+            Some("dead") => {
+                victim_idx += 1;
+                victim =
+                    make_char(&h.client, &format!("Victim {victim_idx}"), "player", 10).await?;
+                call(
+                    &h.client,
+                    "combat.apply_damage",
+                    serde_json::json!({ "character_id": victim, "amount": 30 }),
+                )
+                .await?;
+            }
+            _ => { /* unconscious, keep rolling */ }
+        }
+    };
+    assert_eq!(
+        result["d20"].as_i64(),
+        Some(20),
+        "auto_stabilise requires d20=20"
+    );
+    assert_eq!(result["status"].as_str(), Some("alive"));
+    assert_eq!(result["successes"].as_i64(), Some(0));
+    assert_eq!(result["failures"].as_i64(), Some(0));
+
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": victim }),
+    )
+    .await?;
+    assert_eq!(view["hp_current"].as_i64(), Some(1), "nat-20 sets hp to 1");
+    let conds = view["active_conditions"].as_array().unwrap();
+    assert!(
+        !conds.iter().any(|c| c["condition"] == "mortally_wounded"),
+        "auto_stabilise should clear mortally_wounded; got {conds:?}"
+    );
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+// ── Encounter outcomes: xp_modifier, abandon, fail ─────────────────────────
+
+#[tokio::test]
+async fn encounter_complete_xp_modifier_scales_award() -> Result<()> {
+    let h = connect().await?;
+    let player = make_char(&h.client, "Kira", "player", 20).await?;
+    let enemy = make_char(&h.client, "Goblin", "enemy", 10).await?;
+    let eid = make_encounter(&h.client, &[player], &[enemy], 50).await?;
+
+    let r = call(
+        &h.client,
+        "encounter.complete",
+        serde_json::json!({
+            "encounter_id": eid,
+            "path": "combat_victory",
+            "xp_modifier": 2.0
+        }),
+    )
+    .await?;
+    assert_eq!(r["status"].as_str(), Some("goal_completed"));
+    assert_eq!(
+        r["xp_awarded_total"].as_i64(),
+        Some(100),
+        "50 budget * 2.0 modifier = 100"
+    );
+
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": player }),
+    )
+    .await?;
+    assert_eq!(view["xp_total"].as_i64(), Some(100));
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn encounter_abandon_awards_no_xp_and_flips_status() -> Result<()> {
+    let h = connect().await?;
+    let player = make_char(&h.client, "Kira", "player", 20).await?;
+    let enemy = make_char(&h.client, "Wolf", "enemy", 10).await?;
+    let eid = make_encounter(&h.client, &[player], &[enemy], 100).await?;
+
+    let r = call(
+        &h.client,
+        "encounter.abandon",
+        serde_json::json!({
+            "encounter_id": eid,
+            "reason": "player chose to circle wide"
+        }),
+    )
+    .await?;
+    assert_eq!(r["status"].as_str(), Some("abandoned"));
+
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": player }),
+    )
+    .await?;
+    assert_eq!(view["xp_total"].as_i64(), Some(0), "abandon awards no XP");
+
+    h.client.cancel().await?;
+
+    // Confirm the encounter.abandoned event landed in the log.
+    let conn = Connection::open_with_flags(
+        &h.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind = 'encounter.abandoned' AND encounter_id = ?1",
+        [eid],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn encounter_fail_awards_no_xp_and_flips_status() -> Result<()> {
+    let h = connect().await?;
+    let player = make_char(&h.client, "Kira", "player", 20).await?;
+    let enemy = make_char(&h.client, "Tower", "enemy", 10).await?;
+    let eid = make_encounter(&h.client, &[player], &[enemy], 100).await?;
+
+    let r = call(
+        &h.client,
+        "encounter.fail",
+        serde_json::json!({
+            "encounter_id": eid,
+            "reason": "sun set before reaching the watchtower"
+        }),
+    )
+    .await?;
+    assert_eq!(r["status"].as_str(), Some("failed"));
+
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": player }),
+    )
+    .await?;
+    assert_eq!(view["xp_total"].as_i64(), Some(0), "fail awards no XP");
+
+    h.client.cancel().await?;
+
+    let conn = Connection::open_with_flags(
+        &h.db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind = 'encounter.failed' AND encounter_id = ?1",
+        [eid],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+// ── Conditions tick down on round wrap (parallel to the effect-expiry test) ─
+
+#[tokio::test]
+async fn condition_with_expires_after_rounds_decrements_on_round_wrap() -> Result<()> {
+    let h = connect().await?;
+    let player = make_char(&h.client, "Kira", "player", 20).await?;
+    let enemy = make_char(&h.client, "Goblin", "enemy", 10).await?;
+    let eid = make_encounter(&h.client, &[player], &[enemy], 100).await?;
+    call(
+        &h.client,
+        "combat.start",
+        serde_json::json!({ "encounter_id": eid }),
+    )
+    .await?;
+
+    // Apply a 1-round condition to the player.
+    let cond = call(
+        &h.client,
+        "condition.apply",
+        serde_json::json!({
+            "character_id": player,
+            "condition": "frightened",
+            "severity": 1,
+            "expires_after_rounds": 1
+        }),
+    )
+    .await?;
+    let cond_id = cond["condition_id"].as_i64().unwrap();
+
+    // 2 participants → every 2 next_turns = 1 round wrap. After the first wrap (round 1→2)
+    // the condition should tick from 1 → 0 and deactivate.
+    let _ = call(
+        &h.client,
+        "combat.next_turn",
+        serde_json::json!({ "encounter_id": eid }),
+    )
+    .await?;
+    let r = call(
+        &h.client,
+        "combat.next_turn",
+        serde_json::json!({ "encounter_id": eid }),
+    )
+    .await?;
+    assert_eq!(r["wrapped_to_new_round"].as_bool(), Some(true));
+    let expired = r["expired_condition_ids"].as_array().unwrap();
+    assert!(
+        expired.iter().any(|v| v.as_i64() == Some(cond_id)),
+        "condition should expire on first round-wrap; got {expired:?}"
+    );
+
+    // Player no longer has frightened.
+    let view = call(
+        &h.client,
+        "character.get",
+        serde_json::json!({ "character_id": player }),
+    )
+    .await?;
+    let conds = view["active_conditions"].as_array().unwrap();
+    assert!(
+        !conds.iter().any(|c| c["id"].as_i64() == Some(cond_id)),
+        "expired condition should be gone from active_conditions; got {conds:?}"
+    );
+
     h.client.cancel().await?;
     Ok(())
 }
