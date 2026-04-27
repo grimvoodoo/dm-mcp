@@ -45,3 +45,34 @@ backstory_hooks:
   - "Served ${predecessor} as reeve before the old one passed"
   - "Brokered peace with ${neighbouring_settlement} after ${past_conflict}"
   - "Lost ${relation} to ${past_disaster}"
+
+# Substitution pools for the ${slot} placeholders above. See orc_raider.yaml for
+# the contract — every slot referenced in backstory_hooks (other than the
+# engine-reserved ${years_ago}) must appear here.
+slot_pools:
+  predecessor:
+    - "Old Halfast"
+    - "Mira-the-Steady"
+    - "Reeve Branvik"
+    - "Goodwife Thane"
+  neighbouring_settlement:
+    - "Westfen"
+    - "Stoneford"
+    - "Hollow Hill"
+    - "Pine-Reach"
+  past_conflict:
+    - "the cattle quarrel"
+    - "the salt-tax dispute"
+    - "the boundary trial"
+    - "the year of the broken weir"
+  relation:
+    - "a son"
+    - "a daughter"
+    - "an apprentice"
+    - "a younger brother"
+    - "an older sister"
+  past_disaster:
+    - "the long winter"
+    - "the river fever"
+    - "a wolf-attack"
+    - "the fire that took half the granary"

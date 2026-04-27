@@ -61,3 +61,53 @@ backstory_hooks:
   - "Fled from ${stronger_foe} after losing the duel"
   - "Was exiled from ${tribe} for breaking a sacred law"
   - "Carries a trophy taken from ${victim} at ${place}"
+
+# Substitution pools for the ${slot} placeholders above. ${years_ago} is reserved —
+# the engine fills it with a random integer 1..=50. Every other slot referenced in
+# backstory_hooks must appear here or Content::validate refuses to load.
+# Original prose, no SRD/WotC references.
+slot_pools:
+  settlement:
+    - "Ashbrook"
+    - "Westfen"
+    - "Stoneford"
+    - "Hollow Hill"
+    - "Pine-Reach"
+  oppressor:
+    - "the iron-cloaks"
+    - "the river barons"
+    - "a settler band"
+    - "the southern lord"
+    - "the thane's huntsmen"
+  past_wrong_against_orcs:
+    - "burned the granary"
+    - "broke the salt-treaty"
+    - "hanged a clan-elder"
+    - "defiled the bone-grove"
+  enemy_archetype:
+    - "a settler scout"
+    - "a hunter from the southern woods"
+    - "a river-trader's hired blade"
+    - "a southern soldier in iron"
+  cause:
+    - "a stolen blade"
+    - "an insult to the war-chief"
+    - "a debt of blood"
+    - "a broken oath"
+  stronger_foe:
+    - "a knight in iron"
+    - "a war-shaman of a rival clan"
+    - "a ranger of the royal woods"
+  tribe:
+    - "the Black-Pine clan"
+    - "the Red-Tusk warband"
+    - "the Stone-Bone tribe"
+  victim:
+    - "a foolish merchant"
+    - "a spy in elder-cloth"
+    - "a careless scout"
+  place:
+    - "the river crossing"
+    - "the broken bridge"
+    - "the burned hall"
+    - "the stoneberg pass"

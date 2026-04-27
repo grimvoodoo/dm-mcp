@@ -206,12 +206,13 @@ pub fn generate(
         })
         .collect();
 
-    // Prepare reconciliation substitutions: for slots we can satisfy without touching the
-    // DB, do them here. Everything else stays as ${slot} so the DM agent sees the raw
-    // placeholder.
+    // Substitute every ${slot} the archetype can satisfy from its slot_pools (and the
+    // engine-reserved ${years_ago}). Slots without a pool entry stay raw for the DM
+    // agent — Content::validate enforces full coverage of declared backstory_hooks at
+    // load time, so this is only relevant for forward-compat slots.
     let hook_texts: Vec<String> = chosen_hooks
         .iter()
-        .map(|h| minimal_slot_substitute(h, &mut rng))
+        .map(|h| substitute_slots(h, &arch.slot_pools, &mut rng))
         .collect();
 
     let species_label = arch.species.clone();
@@ -530,11 +531,58 @@ fn pick_many<R: Rng + ?Sized>(rng: &mut R, pool: &[String], n: usize) -> Vec<Str
     shuffled.into_iter().take(n).collect()
 }
 
-/// Replace `${years_ago}` with a concrete integer; leave every other `${slot}` verbatim
-/// so a later reconciliation pass (or the DM agent) can bind it to concrete entities.
-fn minimal_slot_substitute<R: Rng + ?Sized>(template: &str, rng: &mut R) -> String {
-    let years = rng.random_range(1..=50i32);
-    template.replace("${years_ago}", &years.to_string())
+/// Substitute `${slot}` placeholders in a backstory hook template.
+///
+/// - `${years_ago}` — reserved, replaced with a random integer 1..=50.
+/// - Any other `${name}` — looked up in `slot_pools[name]`; if present, replaced with
+///   one randomly picked entry. Missing pool means the slot is left verbatim so a
+///   later reconciliation pass (or the DM agent) can bind it.
+///
+/// `Content::validate` enforces that every slot referenced in `backstory_hooks` (other
+/// than `years_ago`) has a pool entry, so in normal use the verbatim fallback only
+/// fires for forward-compat slots an author hasn't pooled yet.
+fn substitute_slots<R: Rng + ?Sized>(
+    template: &str,
+    slot_pools: &std::collections::BTreeMap<String, Vec<String>>,
+    rng: &mut R,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' || chars.peek() != Some(&'{') {
+            out.push(c);
+            continue;
+        }
+        chars.next(); // consume '{'
+        let mut slot = String::new();
+        let mut closed = false;
+        while let Some(&nc) = chars.peek() {
+            if nc == '}' {
+                chars.next();
+                closed = true;
+                break;
+            }
+            slot.push(nc);
+            chars.next();
+        }
+        if !closed {
+            // Unterminated `${...` — emit the literal we consumed and stop scanning.
+            out.push_str("${");
+            out.push_str(&slot);
+            continue;
+        }
+        if slot == "years_ago" {
+            let years = rng.random_range(1..=50i32);
+            out.push_str(&years.to_string());
+        } else if let Some(pool) = slot_pools.get(&slot).filter(|v| !v.is_empty()) {
+            out.push_str(&pool[rng.random_range(0..pool.len())]);
+        } else {
+            out.push_str("${");
+            out.push_str(&slot);
+            out.push('}');
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
