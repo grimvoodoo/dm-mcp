@@ -231,6 +231,68 @@ async fn generate_orc_raider_and_recall_backstory() -> Result<()> {
 }
 
 #[tokio::test]
+async fn orc_raider_loadout_items_have_real_stats_not_zero() -> Result<()> {
+    // Regression for issue #20: npc.generate's loadout path used to insert items with
+    // base_kinds that weren't in the content catalog (greataxe, handaxe, leather_armor),
+    // which silently materialised as 0-weight, 0-value items. After the fix:
+    //  - those bases are authored in content/items/bases/{weapons,armor}.yaml with
+    //    SRD-aligned stats,
+    //  - Content::validate refuses to load if an archetype loadout names an unknown base.
+    //
+    // This test asserts the orc_raider's loadout produces items whose effective stats
+    // are non-zero — i.e. they're actually backed by real catalog entries.
+    let h = connect().await?;
+    let zone_id = setup_world(&h.client).await?;
+
+    // Generate enough orc_raiders that the probabilistic loadout draws (chance ≤ 1.0)
+    // collectively cover greataxe, handaxe, and leather_armor. With chances 0.7 / 0.5
+    // / 0.9 each, 30 rolls gives a vanishing chance of all three sets being empty
+    // (roughly 0.3^30 + 0.5^30 + 0.1^30 ≈ effectively zero).
+    let mut all_items: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..30 {
+        let gen = call(
+            &h.client,
+            "npc.generate",
+            serde_json::json!({ "archetype": "orc_raider", "zone_id": zone_id }),
+        )
+        .await?;
+        let orc_id = gen["character_id"].as_i64().unwrap();
+        let inv = call(
+            &h.client,
+            "inventory.get",
+            serde_json::json!({ "character_id": orc_id }),
+        )
+        .await?;
+        for item in inv["items"].as_array().unwrap() {
+            all_items.push(item.clone());
+        }
+    }
+
+    // Find at least one of each base kind; assert their effective stats are non-zero.
+    for base in ["greataxe", "handaxe", "leather_armor"] {
+        let item = all_items
+            .iter()
+            .find(|i| i["base_kind"] == base)
+            .unwrap_or_else(|| {
+                panic!(
+                    "30 orc_raider rolls produced no {base}; expected at least one given the archetype's chance roll"
+                )
+            });
+        assert!(
+            item["effective_weight_lb"].as_f64().unwrap_or(0.0) > 0.0,
+            "{base} should have non-zero weight (catalog-backed); got {item:?}"
+        );
+        assert!(
+            item["effective_value_gp"].as_f64().unwrap_or(0.0) > 0.0,
+            "{base} should have non-zero value (catalog-backed); got {item:?}"
+        );
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn recall_filters_by_kind_prefix_and_since_hour() -> Result<()> {
     let h = connect().await?;
     setup_world(&h.client).await?;

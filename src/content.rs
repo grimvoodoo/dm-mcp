@@ -470,6 +470,26 @@ impl Content {
             );
         }
 
+        // Archetype loadouts must only reference known item bases. Without this check,
+        // npc.generate silently creates items with unknown base_kinds — they default to
+        // 0 weight / 0 value, which breaks barter, encumbrance, and combat damage rolls
+        // with no visible error. The inventory.create tool already enforces this for
+        // direct calls (see its docstring); the loadout path was the asymmetric hole.
+        let known_bases: std::collections::HashSet<&str> =
+            self.item_bases.keys().map(String::as_str).collect();
+        for (arch_id, arch) in &self.archetypes {
+            for entry in &arch.loadout {
+                if !known_bases.contains(entry.base_kind.as_str()) {
+                    anyhow::bail!(
+                        "archetype {arch_id:?} loadout references unknown item base {:?}; \
+                         valid bases: {:?}",
+                        entry.base_kind,
+                        known_bases
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -750,6 +770,75 @@ mod tests {
         assert!(
             msg.contains("unknown ability"),
             "error should name the broken invariant: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_archetype_loadout_with_unknown_base() {
+        // Regression for issue #20: an archetype whose loadout names a base_kind that
+        // isn't in item_bases used to silently produce 0-weight, 0-value items at
+        // npc.generate time. Validation now catches this at Content::load.
+        let content = Content {
+            abilities: vec![Ability {
+                id: "str".into(),
+                name: "Strength".into(),
+                governs: "...".into(),
+            }],
+            skills: vec![],
+            damage_types: vec![],
+            conditions: BTreeMap::new(),
+            biomes: BTreeMap::new(),
+            weapons: BTreeMap::new(),
+            enchantments: BTreeMap::new(),
+            archetypes: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "broken_arch".into(),
+                    Archetype {
+                        id: "broken_arch".into(),
+                        species: "human".into(),
+                        role_hint: "enemy".into(),
+                        typical_age_years: Some([20, 40]),
+                        stats: BTreeMap::new(),
+                        hp_formula: Some("1d6".into()),
+                        ac_base: Some(10),
+                        speed_ft: Some(30),
+                        proficiencies: vec![],
+                        loadout: vec![ArchetypeLoadoutEntry {
+                            base_kind: "phantom_sword".into(), // <- not in item_bases
+                            chance: 1.0,
+                            material: None,
+                            material_tier: None,
+                            quantity_dice: None,
+                            equip: None,
+                        }],
+                        plan_pool: vec![],
+                        ideology_pool: vec![],
+                        backstory_hooks: vec![],
+                        hostile_triggers: vec![],
+                        peace_hooks: vec![],
+                        extra: BTreeMap::new(),
+                    },
+                );
+                m
+            },
+            name_pools: BTreeMap::new(),
+            setup_questions: vec![],
+            death_events: vec![],
+            item_bases: BTreeMap::new(),
+            encumbrance: EncumbranceRules {
+                capacity_per_str: 15,
+                encumbered_threshold_pct: 67,
+                overloaded_threshold_pct: 100,
+            },
+        };
+        let err = content
+            .validate()
+            .expect_err("should reject archetype with unknown loadout base");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("phantom_sword") && msg.contains("unknown item base"),
+            "error should name the offending base and what's wrong: {msg}"
         );
     }
 

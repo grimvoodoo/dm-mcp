@@ -1,0 +1,16 @@
+# Armor bases. Weight / value / armor_class_base fields align with the 5.1 SRD;
+# descriptions are original. See docs/items.md and docs/ip-and-licensing.md.
+#
+# `armor_class_base` lives in `extra` (the loader preserves unknown YAML keys via
+# flatten on BaseItem). Combat math currently sets character.armor_class directly;
+# a future phase that derives AC from worn armor will read this field.
+
+armor:
+  leather_armor:
+    name: "Leather armor"
+    description: "Stiffened, oiled hide cut into overlapping plates. Quiet to move in and forgiving on long marches; little help against a serious blow."
+    weight_lb: 10
+    base_value_gp: 10
+    properties: [light]
+    slot: chest
+    armor_class_base: 11
