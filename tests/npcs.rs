@@ -244,12 +244,17 @@ async fn orc_raider_loadout_items_have_real_stats_not_zero() -> Result<()> {
     let h = connect().await?;
     let zone_id = setup_world(&h.client).await?;
 
-    // Generate enough orc_raiders that the probabilistic loadout draws (chance ≤ 1.0)
-    // collectively cover greataxe, handaxe, and leather_armor. With chances 0.7 / 0.5
-    // / 0.9 each, 30 rolls gives a vanishing chance of all three sets being empty
-    // (roughly 0.3^30 + 0.5^30 + 0.1^30 ≈ effectively zero).
+    // Roll enough orc_raiders to probabilistically surface all three new bases at
+    // least once across the collected loadouts. Loadout chances are 0.7 / 0.5 / 0.9;
+    // the limiting case is handaxe at 0.5, where N=10 rolls gives a false-fail rate
+    // of 0.5^10 ≈ 0.001. Dropping below ~10 starts to flake; raising further just
+    // adds CI runtime without meaningful confidence gain.
+    //
+    // (npc.generate doesn't currently expose a seed param — if it ever does, this
+    // can become a single deterministic generate call.)
+    const N: usize = 10;
     let mut all_items: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..30 {
+    for _ in 0..N {
         let gen = call(
             &h.client,
             "npc.generate",
@@ -269,21 +274,29 @@ async fn orc_raider_loadout_items_have_real_stats_not_zero() -> Result<()> {
     }
 
     // Find at least one of each base kind; assert their effective stats are non-zero.
+    // Use .expect() rather than .unwrap_or(0.0) so a missing JSON key fails with the
+    // missing key, not a confusingly mis-attributed "weight is zero" message.
     for base in ["greataxe", "handaxe", "leather_armor"] {
         let item = all_items
             .iter()
             .find(|i| i["base_kind"] == base)
             .unwrap_or_else(|| {
                 panic!(
-                    "30 orc_raider rolls produced no {base}; expected at least one given the archetype's chance roll"
+                    "{N} orc_raider rolls produced no {base}; expected at least one given the archetype's chance roll"
                 )
             });
+        let weight = item["effective_weight_lb"]
+            .as_f64()
+            .expect("effective_weight_lb on item should be a number");
+        let value = item["effective_value_gp"]
+            .as_f64()
+            .expect("effective_value_gp on item should be a number");
         assert!(
-            item["effective_weight_lb"].as_f64().unwrap_or(0.0) > 0.0,
+            weight > 0.0,
             "{base} should have non-zero weight (catalog-backed); got {item:?}"
         );
         assert!(
-            item["effective_value_gp"].as_f64().unwrap_or(0.0) > 0.0,
+            value > 0.0,
             "{base} should have non-zero value (catalog-backed); got {item:?}"
         );
     }

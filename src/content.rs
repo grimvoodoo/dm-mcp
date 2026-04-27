@@ -475,7 +475,10 @@ impl Content {
         // 0 weight / 0 value, which breaks barter, encumbrance, and combat damage rolls
         // with no visible error. The inventory.create tool already enforces this for
         // direct calls (see its docstring); the loadout path was the asymmetric hole.
-        let known_bases: std::collections::HashSet<&str> =
+        // BTreeSet (not HashSet) so the {:?} dump in the bail! below renders bases in
+        // deterministic alphabetical order — easier for content authors to scan against
+        // a known reference and stable across runs for any future snapshot test.
+        let known_bases: std::collections::BTreeSet<&str> =
             self.item_bases.keys().map(String::as_str).collect();
         for (arch_id, arch) in &self.archetypes {
             for entry in &arch.loadout {
