@@ -1,6 +1,5 @@
-# One sample weapon base for Phase 2. The damage/weight/value fields align with
-# the 5.1 SRD's longsword entry; description is original. See docs/items.md and
-# docs/ip-and-licensing.md.
+# Weapon bases. Damage / weight / value fields align with the 5.1 SRD; descriptions
+# are original. See docs/items.md and docs/ip-and-licensing.md.
 
 weapons:
   longsword:
@@ -12,3 +11,24 @@ weapons:
     base_value_gp: 15
     properties: [versatile]
     slot: main-hand
+
+  greataxe:
+    name: Greataxe
+    description: "A massive single-bitted axe meant for two-handed swings. Punishingly heavy in untrained hands; brutally effective in trained ones."
+    damage: 1d12
+    damage_type: slashing
+    weight_lb: 7
+    base_value_gp: 30
+    properties: [heavy, two-handed]
+    slot: main-hand
+
+  handaxe:
+    name: Handaxe
+    description: "A short-hafted axe balanced for both melee and a quick toss. Works well as a sidearm or thrown follow-up."
+    damage: 1d6
+    damage_type: slashing
+    weight_lb: 2
+    base_value_gp: 5
+    properties: [light, thrown]
+    # Could go off-hand or main-hand; archetype loadouts may override at apply time.
+    slot: off-hand
