@@ -161,7 +161,7 @@ pub fn travel(conn: &mut Connection, p: TravelParams) -> Result<TravelResult> {
     )
     .context("update character.current_zone_id")?;
 
-    // 2. character_zone_knowledge upsert to 'visited'.
+    // 2. character_zone_knowledge upsert to 'visited' for the destination.
     upsert_knowledge_tx(
         &tx,
         p.character_id,
@@ -170,8 +170,37 @@ pub fn travel(conn: &mut Connection, p: TravelParams) -> Result<TravelResult> {
         hour_after,
     )?;
 
+    // 2b. Defensive: also bump the origin to 'visited'. The character was just there,
+    // so they know it. Normally character.create has already seeded this; this catches
+    // the edge case where it wasn't (e.g. legacy data, non-API insertion).
+    upsert_knowledge_tx(
+        &tx,
+        p.character_id,
+        from_zone_id,
+        KnowledgeLevel::Visited,
+        hour_before,
+    )?;
+
     // 3. Stub-gen any missing neighbours of the destination zone.
     let stubs_generated = ensure_stub_neighbours_tx(&tx, p.to_zone_id)?;
+
+    // 3b. Mark every neighbour of the destination as at least 'rumored' so the map can
+    // show the player their next-move options. Includes any stubs just generated above.
+    // upsert_knowledge_tx is monotonic — if the player already knew a neighbour better
+    // than rumored, the existing level is preserved.
+    let dest_neighbours: Vec<i64> = read_outgoing_edges(&tx, p.to_zone_id)?
+        .into_iter()
+        .map(|e| e.to_zone_id)
+        .collect();
+    for nzid in dest_neighbours {
+        upsert_knowledge_tx(
+            &tx,
+            p.character_id,
+            nzid,
+            KnowledgeLevel::Rumored,
+            hour_after,
+        )?;
+    }
 
     // 4. First-visit landmark generation.
     let landmarks_generated = if first_visit {
@@ -241,6 +270,18 @@ pub fn map(conn: &Connection, p: MapParams) -> Result<MapResult> {
     // BFS from origin assigning grid positions. Limit BFS to known zones (rumored or
     // better) so unknown zones don't leak into the map.
     let known: BTreeMap<i64, String> = read_known_zone_levels(conn, p.character_id)?;
+    if !known.contains_key(&origin_zone_id) {
+        // Strict knowledge check — symmetric with describe_zone. character.create seeds
+        // 'visited' for the starting zone and travel tops it up, so this is unreachable
+        // in normal API use. If it does fire, the data is inconsistent and silently
+        // returning a map where origin is 'rumored' (the prior fallback) hides the bug.
+        bail!(
+            "character {} has no knowledge of their current zone {} \
+             (data inconsistency — character.create / world.travel should have seeded this)",
+            p.character_id,
+            origin_zone_id
+        );
+    }
     let mut positions: BTreeMap<i64, (i32, i32)> = BTreeMap::new();
     positions.insert(origin_zone_id, (0, 0));
 
@@ -269,7 +310,12 @@ pub fn map(conn: &Connection, p: MapParams) -> Result<MapResult> {
     // Hydrate the zone payloads.
     let mut zones = Vec::new();
     for (zid, (x, y)) in positions {
-        let level = known.get(&zid).cloned().unwrap_or_else(|| "rumored".into());
+        // BFS only inserts zones present in `known` (origin is gated by the bail above,
+        // expansion checks `known.contains_key` per neighbour), so this lookup never misses.
+        let level = known
+            .get(&zid)
+            .cloned()
+            .expect("BFS only walks zones in `known`");
         let row: (String, String, String) = conn.query_row(
             "SELECT name, biome, kind FROM zones WHERE id = ?1",
             [zid],
@@ -754,13 +800,8 @@ mod tests {
         )
         .unwrap()
         .character_id;
-        // Mark starting zone as visited for the player up-front so it appears on the map.
-        conn.execute(
-            "INSERT INTO character_zone_knowledge (character_id, zone_id, level)
-             VALUES (?1, ?2, 'visited')",
-            params![player, gw.starting_zone_id],
-        )
-        .unwrap();
+        // characters::create now seeds 'visited' knowledge of the starting zone as part
+        // of the same transaction — no manual upsert needed here.
         (player, gw.neighbour_zone_ids, gw.starting_zone_id)
     }
 

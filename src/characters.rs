@@ -298,6 +298,21 @@ pub fn create(conn: &mut Connection, p: CreateParams) -> Result<CreateResult> {
         )
         .context("insert characters row")?;
         let id = tx.last_insert_rowid();
+
+        // Seed knowledge of the starting zone. A character placed at a zone "knows"
+        // they are there — without this, world.describe_zone refuses to describe the
+        // character's own current location and world.map can't anchor at it.
+        // Order-independent with setup.mark_ready: both upsert visited, idempotently.
+        if let Some(zone_id) = p.current_zone_id {
+            tx.execute(
+                "INSERT INTO character_zone_knowledge
+                    (character_id, zone_id, level, last_visit_at_hour)
+                 VALUES (?1, ?2, 'visited', 0)
+                 ON CONFLICT(character_id, zone_id) DO UPDATE SET level = 'visited'",
+                params![id, zone_id],
+            )
+            .context("seed character knowledge of starting zone")?;
+        }
         tx.commit().context("commit create tx")?;
         id
     };
