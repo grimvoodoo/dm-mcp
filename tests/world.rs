@@ -213,6 +213,132 @@ async fn travel_to_neighbour_advances_clock_and_fog_and_map() -> Result<()> {
     Ok(())
 }
 
+// ── Regression tests for issue #15 (knowledge seeding) and #16 (map/describe parity)
+
+#[tokio::test]
+async fn character_create_seeds_visited_knowledge_for_starting_zone() -> Result<()> {
+    // #15 symptom 1: character.create with current_zone_id used to leave the player
+    // unable to describe their own current zone. After the fix, a freshly-created
+    // character can immediately describe_zone for where they are.
+    let h = connect().await?;
+    let (player, starting, _neighbours) = bootstrap(&h.client).await?;
+
+    let r = call(
+        &h.client,
+        "world.describe_zone",
+        serde_json::json!({ "character_id": player, "zone_id": starting }),
+    )
+    .await?;
+    assert_eq!(
+        r["knowledge_level"].as_str(),
+        Some("visited"),
+        "character.create with current_zone_id should seed visited knowledge"
+    );
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn travel_seeds_origin_knowledge_so_describe_works_for_back_edge() -> Result<()> {
+    // #15 symptom 2: world.travel only upserted the destination. After a 1→2 hop the
+    // player could no longer describe zone 1 (back-edge). The fix also upserts the
+    // origin defensively. Combined with the character.create seeding above, this
+    // closes the symptom even for legacy data without the create-time seeding.
+    let h = connect().await?;
+    let (player, starting, neighbours) = bootstrap(&h.client).await?;
+    let target = neighbours[0];
+
+    call(
+        &h.client,
+        "world.travel",
+        serde_json::json!({ "character_id": player, "to_zone_id": target }),
+    )
+    .await?;
+
+    // After travelling to target, the player should still be able to describe the
+    // zone they came from.
+    let r = call(
+        &h.client,
+        "world.describe_zone",
+        serde_json::json!({ "character_id": player, "zone_id": starting }),
+    )
+    .await?;
+    assert_eq!(r["knowledge_level"].as_str(), Some("visited"));
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn travel_seeds_destination_neighbours_as_rumored_for_map_visibility() -> Result<()> {
+    // #15 symptom 3: after travelling 1→2, world.map showed zone 2 with zero
+    // connections, even though zone 2 had real edges to {1, plus stub neighbours}.
+    // The fix marks every neighbour of the destination as at least 'rumored' so the
+    // map can show next-move options.
+    let h = connect().await?;
+    let (player, starting, neighbours) = bootstrap(&h.client).await?;
+    let target = neighbours[0];
+
+    call(
+        &h.client,
+        "world.travel",
+        serde_json::json!({ "character_id": player, "to_zone_id": target }),
+    )
+    .await?;
+
+    let m = call(
+        &h.client,
+        "world.map",
+        serde_json::json!({ "character_id": player }),
+    )
+    .await?;
+    let zones = m["zones"].as_array().unwrap();
+    let zone_ids: Vec<i64> = zones.iter().map(|z| z["id"].as_i64().unwrap()).collect();
+
+    // Player is at target. Map must show:
+    //  - target itself (visited, origin),
+    //  - starting (visited, came from there),
+    //  - the back-edge connection (verified in the older travel test).
+    assert!(
+        zone_ids.contains(&target),
+        "map must include target (origin); got {zone_ids:?}"
+    );
+    assert!(
+        zone_ids.contains(&starting),
+        "map must include starting (back-edge — was visited en route); got {zone_ids:?}"
+    );
+
+    // Plus: target had stub neighbours generated during travel (because target was a
+    // stub leaf with only the back-edge before). Those should now be 'rumored' on the
+    // map, not invisible.
+    let conns = m["connections"].as_array().unwrap();
+    let outgoing_from_target: Vec<i64> = conns
+        .iter()
+        .filter_map(|c| {
+            let from = c["from_zone_id"].as_i64()?;
+            let to = c["to_zone_id"].as_i64()?;
+            (from == target).then_some(to)
+        })
+        .collect();
+    assert!(
+        outgoing_from_target.len() >= 2,
+        "target should expose its back-edge to starting plus at least one new stub \
+         neighbour as a connection on the map; got connections {conns:?}"
+    );
+
+    // Every zone listed on the map must have a knowledge_level (not absent or null):
+    // verifies #16 — map and describe agree on the knowledge predicate.
+    for z in zones {
+        let lvl = z["knowledge_level"].as_str().unwrap_or("");
+        assert!(
+            ["rumored", "known", "visited", "mapped"].contains(&lvl),
+            "every map zone must have a real knowledge level; got {z:?}"
+        );
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn world_tools_are_listed() -> Result<()> {
     let h = connect().await?;
