@@ -205,6 +205,15 @@ pub struct ConditionRow {
     pub id: i64,
     pub condition: String,
     pub severity: i32,
+    /// Event id of whatever caused this condition, if the application call chained one.
+    pub source_event_id: Option<i64>,
+    /// Optional in-game-hour expiry (decremented at hour-time, not round-time).
+    pub expires_at_hour: Option<i64>,
+    /// Optional round-based expiry. Ticked by `combat.next_turn` at round boundaries.
+    pub expires_after_rounds: Option<i32>,
+    /// Optional save-on-retry spec (e.g. `save:con:dc15`). The DM agent reads this to
+    /// know whether the character can attempt a periodic save to throw the condition off.
+    pub remove_on_save: Option<String>,
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -687,8 +696,13 @@ fn load_resources(conn: &Connection, character_id: i64) -> Result<Vec<ResourceRo
 }
 
 fn load_active_conditions(conn: &Connection, character_id: i64) -> Result<Vec<ConditionRow>> {
+    // Surface every optional field stored on character_conditions, mirroring how
+    // load_active_effects exposes effects' full shape. Without this, fields like
+    // remove_on_save are write-only — the DM agent can apply a condition with a save
+    // spec but can never read it back to know the spec exists.
     let mut stmt = conn.prepare(
-        "SELECT id, condition, severity
+        "SELECT id, condition, severity,
+                source_event_id, expires_at_hour, expires_after_rounds, remove_on_save
          FROM character_conditions
          WHERE character_id = ?1 AND active = 1
          ORDER BY id",
@@ -699,6 +713,10 @@ fn load_active_conditions(conn: &Connection, character_id: i64) -> Result<Vec<Co
                 id: row.get(0)?,
                 condition: row.get(1)?,
                 severity: row.get(2)?,
+                source_event_id: row.get(3)?,
+                expires_at_hour: row.get(4)?,
+                expires_after_rounds: row.get(5)?,
+                remove_on_save: row.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
