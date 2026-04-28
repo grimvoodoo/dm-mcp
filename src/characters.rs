@@ -254,82 +254,80 @@ pub fn create(conn: &mut Connection, p: CreateParams) -> Result<CreateResult> {
     let initiative_bonus = p.initiative_bonus.unwrap_or(0);
     let loyalty = p.loyalty.unwrap_or_else(default_loyalty);
 
-    // Insert the character row. `created_at`/`updated_at` are campaign_hour; in Phase 4
-    // the clock is always 0 — see docs/history-log.md, advanced in Phase 6+.
-    let character_id = {
-        let tx = conn.transaction().context("begin create tx")?;
+    // Single transaction wraps the row insert, the optional zone-knowledge seed, AND
+    // the character.created event so all three commit atomically. Pre-fix, the event
+    // emitted on a separate top-level call meant a process crash between the two
+    // could leave a character row with no matching event in the log (issue #29).
+    // tx.last_insert_rowid() resolves the FK reference inside the same tx, so the
+    // event participant row points at the new id without needing a commit first.
+    let tx = conn.transaction().context("begin create tx")?;
+    tx.execute(
+        "INSERT INTO characters (
+            name, role, party_id,
+            str_score, dex_score, con_score, int_score, wis_score, cha_score,
+            hp_current, hp_max, hp_temp,
+            armor_class, speed_ft, initiative_bonus,
+            size,
+            species, class_or_archetype, ideology, backstory, plans,
+            loyalty,
+            current_zone_id,
+            created_at, updated_at
+        ) VALUES (
+            ?1, ?2, ?3,
+            ?4, ?5, ?6, ?7, ?8, ?9,
+            ?10, ?11, 0,
+            ?12, ?13, ?14,
+            ?15,
+            ?16, ?17, ?18, ?19, ?20,
+            ?21,
+            ?22,
+            0, 0
+        )",
+        params![
+            p.name,
+            p.role,
+            p.party_id,
+            p.str_score,
+            p.dex_score,
+            p.con_score,
+            p.int_score,
+            p.wis_score,
+            p.cha_score,
+            hp_current,
+            hp_max,
+            armor_class,
+            speed_ft,
+            initiative_bonus,
+            size,
+            p.species,
+            p.class_or_archetype,
+            p.ideology,
+            p.backstory,
+            p.plans,
+            loyalty,
+            p.current_zone_id,
+        ],
+    )
+    .context("insert characters row")?;
+    let character_id = tx.last_insert_rowid();
+
+    // Seed knowledge of the starting zone. A character placed at a zone "knows"
+    // they are there — without this, world.describe_zone refuses to describe the
+    // character's own current location and world.map can't anchor at it.
+    // Order-independent with setup.mark_ready: both upsert visited, idempotently.
+    if let Some(zone_id) = p.current_zone_id {
         tx.execute(
-            "INSERT INTO characters (
-                name, role, party_id,
-                str_score, dex_score, con_score, int_score, wis_score, cha_score,
-                hp_current, hp_max, hp_temp,
-                armor_class, speed_ft, initiative_bonus,
-                size,
-                species, class_or_archetype, ideology, backstory, plans,
-                loyalty,
-                current_zone_id,
-                created_at, updated_at
-            ) VALUES (
-                ?1, ?2, ?3,
-                ?4, ?5, ?6, ?7, ?8, ?9,
-                ?10, ?11, 0,
-                ?12, ?13, ?14,
-                ?15,
-                ?16, ?17, ?18, ?19, ?20,
-                ?21,
-                ?22,
-                0, 0
-            )",
-            params![
-                p.name,
-                p.role,
-                p.party_id,
-                p.str_score,
-                p.dex_score,
-                p.con_score,
-                p.int_score,
-                p.wis_score,
-                p.cha_score,
-                hp_current,
-                hp_max,
-                armor_class,
-                speed_ft,
-                initiative_bonus,
-                size,
-                p.species,
-                p.class_or_archetype,
-                p.ideology,
-                p.backstory,
-                p.plans,
-                loyalty,
-                p.current_zone_id,
-            ],
+            "INSERT INTO character_zone_knowledge
+                (character_id, zone_id, level, last_visit_at_hour)
+             VALUES (?1, ?2, 'visited', 0)
+             ON CONFLICT(character_id, zone_id) DO UPDATE SET level = 'visited'",
+            params![character_id, zone_id],
         )
-        .context("insert characters row")?;
-        let id = tx.last_insert_rowid();
+        .context("seed character knowledge of starting zone")?;
+    }
 
-        // Seed knowledge of the starting zone. A character placed at a zone "knows"
-        // they are there — without this, world.describe_zone refuses to describe the
-        // character's own current location and world.map can't anchor at it.
-        // Order-independent with setup.mark_ready: both upsert visited, idempotently.
-        if let Some(zone_id) = p.current_zone_id {
-            tx.execute(
-                "INSERT INTO character_zone_knowledge
-                    (character_id, zone_id, level, last_visit_at_hour)
-                 VALUES (?1, ?2, 'visited', 0)
-                 ON CONFLICT(character_id, zone_id) DO UPDATE SET level = 'visited'",
-                params![id, zone_id],
-            )
-            .context("seed character knowledge of starting zone")?;
-        }
-        tx.commit().context("commit create tx")?;
-        id
-    };
-
-    // Emit the event on a separate transaction so the character row is visible first; the
-    // EventSpec references `character_id` which must resolve via the FK.
-    let emitted = events::emit(
-        conn,
+    let emitted = events::emit_in_tx(
+        &tx,
         &EventSpec {
             kind: "character.created",
             campaign_hour: 0,
@@ -361,6 +359,8 @@ pub fn create(conn: &mut Connection, p: CreateParams) -> Result<CreateResult> {
             items: &[],
         },
     )?;
+
+    tx.commit().context("commit create tx")?;
 
     Ok(CreateResult {
         character_id,
@@ -445,7 +445,12 @@ pub fn get(conn: &Connection, character_id: i64) -> Result<CharacterView> {
 
 /// Update the `plans` prose field and emit `npc.plan_changed`.
 pub fn update_plans(conn: &mut Connection, p: UpdatePlansParams) -> Result<UpdateResult> {
-    let old_plans: Option<String> = conn
+    // Single tx so the row UPDATE + the npc.plan_changed event commit atomically.
+    // Pre-fix the event was emitted on a separate top-level call; a process crash
+    // between the two left the plans field mutated with no event in the log
+    // (issue #29 — append-only event-log invariant).
+    let tx = conn.transaction().context("begin update_plans tx")?;
+    let old_plans: Option<String> = tx
         .query_row(
             "SELECT plans FROM characters WHERE id = ?1",
             [p.character_id],
@@ -454,14 +459,14 @@ pub fn update_plans(conn: &mut Connection, p: UpdatePlansParams) -> Result<Updat
         .optional_ok()?
         .ok_or_else(|| anyhow::anyhow!("character {} not found", p.character_id))?;
 
-    conn.execute(
+    tx.execute(
         "UPDATE characters SET plans = ?1, updated_at = 0 WHERE id = ?2",
         params![p.new_plans, p.character_id],
     )
     .context("update plans")?;
 
-    let emitted = events::emit(
-        conn,
+    let emitted = events::emit_in_tx(
+        &tx,
         &EventSpec {
             kind: "npc.plan_changed",
             campaign_hour: 0,
@@ -483,6 +488,8 @@ pub fn update_plans(conn: &mut Connection, p: UpdatePlansParams) -> Result<Updat
         },
     )?;
 
+    tx.commit().context("commit update_plans tx")?;
+
     Ok(UpdateResult {
         character_id: p.character_id,
         event_id: emitted.event_id,
@@ -495,7 +502,9 @@ pub fn change_role(conn: &mut Connection, p: ChangeRoleParams) -> Result<UpdateR
         bail!("unknown role {:?}; valid: {VALID_ROLES:?}", p.new_role);
     }
 
-    let old_role: String = conn
+    // Same atomicity rationale as update_plans (#29).
+    let tx = conn.transaction().context("begin change_role tx")?;
+    let old_role: String = tx
         .query_row(
             "SELECT role FROM characters WHERE id = ?1",
             [p.character_id],
@@ -504,14 +513,14 @@ pub fn change_role(conn: &mut Connection, p: ChangeRoleParams) -> Result<UpdateR
         .optional_ok()?
         .ok_or_else(|| anyhow::anyhow!("character {} not found", p.character_id))?;
 
-    conn.execute(
+    tx.execute(
         "UPDATE characters SET role = ?1, updated_at = 0 WHERE id = ?2",
         params![p.new_role, p.character_id],
     )
     .context("update role")?;
 
-    let emitted = events::emit(
-        conn,
+    let emitted = events::emit_in_tx(
+        &tx,
         &EventSpec {
             kind: "npc.role_changed",
             campaign_hour: 0,
@@ -535,6 +544,8 @@ pub fn change_role(conn: &mut Connection, p: ChangeRoleParams) -> Result<UpdateR
             items: &[],
         },
     )?;
+
+    tx.commit().context("commit change_role tx")?;
 
     Ok(UpdateResult {
         character_id: p.character_id,
