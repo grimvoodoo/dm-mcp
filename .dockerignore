@@ -1,6 +1,7 @@
 target
 .git
 .github
+.githooks
 .claude
 .pids
 .logs
@@ -9,6 +10,16 @@ target
 campaign.db
 campaign.db-wal
 campaign.db-shm
+
+# Per-developer dotfiles / local config that have no place in the build context
+.env
+.env.*
+.envrc
+.mcp.json
+*.log
+.vscode
+.idea
+.DS_Store
 
 # Not needed for the build
 docs
