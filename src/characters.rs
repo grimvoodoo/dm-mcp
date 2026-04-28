@@ -247,12 +247,52 @@ pub fn create(conn: &mut Connection, p: CreateParams) -> Result<CreateResult> {
         bail!("unknown size {:?}; valid: {VALID_SIZES:?}", size);
     }
 
+    // Defensive bounds (#32). The MCP boundary is the trust line — an LLM agent SHOULD
+    // pass sane values, but the tool surface needs to defend against the cases where
+    // it doesn't (or where a future agent does something unexpected). Without these
+    // checks, e.g. str_score=999 produces a giant ability_modifier that breaks every
+    // downstream check, and i32::MAX HP overflows when added to. Bounds picked
+    // generously to accommodate exotic content (giants, dragons) without being
+    // unbounded.
+    for (label, value) in &[
+        ("str_score", p.str_score),
+        ("dex_score", p.dex_score),
+        ("con_score", p.con_score),
+        ("int_score", p.int_score),
+        ("wis_score", p.wis_score),
+        ("cha_score", p.cha_score),
+    ] {
+        if !(1..=30).contains(value) {
+            bail!("{label} must be in 1..=30 (got {value})");
+        }
+    }
+
     let hp_max = p.hp_max.unwrap_or_else(default_hp);
+    if !(1..=10_000).contains(&hp_max) {
+        bail!("hp_max must be in 1..=10_000 (got {hp_max})");
+    }
     let hp_current = p.hp_current.unwrap_or(hp_max);
+    if !(0..=hp_max).contains(&hp_current) {
+        bail!("hp_current must be in 0..=hp_max ({hp_max}) (got {hp_current})");
+    }
     let armor_class = p.armor_class.unwrap_or_else(default_ac);
+    if !(1..=50).contains(&armor_class) {
+        bail!("armor_class must be in 1..=50 (got {armor_class})");
+    }
     let speed_ft = p.speed_ft.unwrap_or_else(default_speed);
+    if !(0..=1_000).contains(&speed_ft) {
+        bail!("speed_ft must be in 0..=1_000 (got {speed_ft})");
+    }
     let initiative_bonus = p.initiative_bonus.unwrap_or(0);
+    if !(-20..=20).contains(&initiative_bonus) {
+        bail!("initiative_bonus must be in -20..=20 (got {initiative_bonus})");
+    }
     let loyalty = p.loyalty.unwrap_or_else(default_loyalty);
+    if !(0..=100).contains(&loyalty) {
+        // The schema's CHECK constraint enforces this too, but bailing here gives a
+        // clearer error than the FK violation that would surface at INSERT time.
+        bail!("loyalty must be in 0..=100 (got {loyalty})");
+    }
 
     // Single transaction wraps the row insert, the optional zone-knowledge seed, AND
     // the character.created event so all three commit atomically. Pre-fix, the event
@@ -829,6 +869,60 @@ mod tests {
         let mut p = sample_params("X");
         p.role = "villain".into();
         assert!(create(&mut conn, p).is_err());
+    }
+
+    #[test]
+    fn create_rejects_out_of_range_ability_scores() {
+        // Each ability score; pick a few representative bad values. Coerce closures to
+        // the same `fn(&mut CreateParams)` type — without that, each closure literal
+        // has a unique anonymous type and the array doesn't unify.
+        type Mutator = fn(&mut CreateParams);
+        let mut conn = fresh_conn();
+        let mutators: &[(&str, Mutator)] = &[
+            ("str_score=999", |p| p.str_score = 999),
+            ("dex_score=-5", |p| p.dex_score = -5),
+            ("con_score=0", |p| p.con_score = 0),
+            ("int_score=31", |p| p.int_score = 31),
+        ];
+        for (label, mutator) in mutators {
+            let mut p = sample_params("X");
+            mutator(&mut p);
+            let err = create(&mut conn, p).expect_err(label);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("1..=30"),
+                "{label}: error should cite the bound: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_rejects_inverted_hp_relationship() {
+        let mut conn = fresh_conn();
+        let mut p = sample_params("X");
+        p.hp_max = Some(10);
+        p.hp_current = Some(50);
+        let err = create(&mut conn, p).expect_err("hp_current > hp_max should bail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hp_current") && msg.contains("hp_max"));
+    }
+
+    #[test]
+    fn create_rejects_out_of_range_loyalty() {
+        let mut conn = fresh_conn();
+        let mut p = sample_params("X");
+        p.loyalty = Some(150);
+        let err = create(&mut conn, p).expect_err("loyalty > 100 should bail");
+        assert!(format!("{err:#}").contains("loyalty"));
+    }
+
+    #[test]
+    fn create_rejects_overflow_hp_max() {
+        let mut conn = fresh_conn();
+        let mut p = sample_params("X");
+        p.hp_max = Some(i32::MAX);
+        let err = create(&mut conn, p).expect_err("i32::MAX hp should bail");
+        assert!(format!("{err:#}").contains("hp_max"));
     }
 
     #[test]
