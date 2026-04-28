@@ -873,11 +873,12 @@ mod tests {
 
     #[test]
     fn create_rejects_out_of_range_ability_scores() {
-        let mut conn = fresh_conn();
         // Each ability score; pick a few representative bad values. Coerce closures to
-        // the same `fn(&mut CreateParams)` type via the `as` cast — without that, each
-        // closure literal has a unique anonymous type and the array doesn't unify.
-        let mutators: &[(&str, fn(&mut CreateParams))] = &[
+        // the same `fn(&mut CreateParams)` type — without that, each closure literal
+        // has a unique anonymous type and the array doesn't unify.
+        type Mutator = fn(&mut CreateParams);
+        let mut conn = fresh_conn();
+        let mutators: &[(&str, Mutator)] = &[
             ("str_score=999", |p| p.str_score = 999),
             ("dex_score=-5", |p| p.dex_score = -5),
             ("con_score=0", |p| p.con_score = 0),
