@@ -57,6 +57,53 @@ pub struct DiceRollParams {
     pub spec: String,
 }
 
+/// Marker error type for caller-facing validation failures (issue #34). Domain code
+/// that wants the resulting MCP error to be classified as `invalid_params` (i.e. "you
+/// passed bad input") rather than `internal_error` ("the server broke") wraps its
+/// `anyhow::Error` in this newtype. The `with_db*` helpers below downcast and pick the
+/// right MCP error variant.
+///
+/// Without this distinction, every domain bail! — including a SQLite I/O error or a
+/// content-load issue — got tagged as `invalid_params`, polluting the consumer's error
+/// analytics and giving misleading retry signals.
+///
+/// Migrations are gradual: code that hasn't been migrated yet stays on plain
+/// `bail!`/`anyhow!`, which classifies as `internal_error` (the safer default — the
+/// caller didn't necessarily do anything wrong, so don't blame them).
+#[derive(Debug)]
+pub struct ToolUserError(pub String);
+
+impl std::fmt::Display for ToolUserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ToolUserError {}
+
+/// Convenience: build a ToolUserError-wrapped anyhow::Error in one call. Used as
+/// `bail_user!("character {} not found", id)` from domain code, equivalent to
+/// `bail!(ToolUserError(format!(...)))` but shorter.
+#[macro_export]
+macro_rules! bail_user {
+    ($($arg:tt)*) => {
+        return ::std::result::Result::Err(
+            ::anyhow::anyhow!($crate::handler::ToolUserError(format!($($arg)*)))
+        )
+    };
+}
+
+/// Classify an anyhow error and wrap it in the right McpError variant. ToolUserError
+/// → invalid_params (caller's fault); anything else → internal_error (server's
+/// problem). The error message is preserved verbatim in both cases.
+fn classify_tool_error(e: anyhow::Error) -> McpError {
+    if e.downcast_ref::<ToolUserError>().is_some() {
+        McpError::invalid_params(format!("{e:#}"), None)
+    } else {
+        McpError::internal_error(format!("{e:#}"), None)
+    }
+}
+
 /// Small helper — take a mutex on the DB, run a callback, serialise the result as JSON
 /// inside a CallToolResult. Keeps tool bodies tight.
 fn with_db_mut<F, T>(db: &DbHandle, f: F) -> Result<CallToolResult, McpError>
@@ -68,7 +115,7 @@ where
         let mut conn = db
             .lock()
             .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
-        f(&mut conn).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        f(&mut conn).map_err(classify_tool_error)?
     };
     let json = serde_json::to_string(&value)
         .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
@@ -84,7 +131,7 @@ where
         let conn = db
             .lock()
             .map_err(|_| McpError::internal_error("DB mutex poisoned".to_string(), None))?;
-        f(&conn).map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?
+        f(&conn).map_err(classify_tool_error)?
     };
     let json = serde_json::to_string(&value)
         .map_err(|e| McpError::internal_error(format!("serialise response: {e}"), None))?;
@@ -913,5 +960,65 @@ impl ServerHandler for DmMcpHandler {
             "dm-mcp: MCP toolkit for AI Dungeon Masters. Phase 10 adds inventory (create/pickup/drop/equip/unequip/get/inspect/transfer) with encumbrance enforcement (pickup refused above overloaded threshold, 'encumbered' condition applied between encumbered and overloaded thresholds) and barter.exchange (persuasion-check-driven rate). Live tools: server.info, content.introspect, dice.roll, character.*, apply_effect, dispel_effect, proficiency.*, resource.*, condition.*, resolve_check, setup.*, world.*, npc.generate, character.recall, encounter.*, combat.*, roll_death_save, roll_death_event, rest.short, rest.long, inventory.*, barter.exchange.".to_string(),
         );
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_tool_user_error_as_invalid_params() {
+        // The marker type is recognised — caller-facing errors get tagged invalid_params.
+        let err: anyhow::Error = anyhow::anyhow!(ToolUserError("you passed bad input".into()));
+        let mcp = classify_tool_error(err);
+        // Inspect via Debug since McpError doesn't expose its code field publicly.
+        let dbg = format!("{mcp:?}");
+        assert!(
+            dbg.contains("InvalidParams")
+                || dbg.contains("invalid_params")
+                || dbg.contains("-32602"),
+            "ToolUserError should classify as invalid_params; got {dbg}"
+        );
+        assert!(
+            dbg.contains("you passed bad input"),
+            "message should be preserved: {dbg}"
+        );
+    }
+
+    #[test]
+    fn classify_plain_anyhow_as_internal_error() {
+        // Default for un-wrapped errors: internal_error. Pre-fix this was invalid_params,
+        // which incorrectly blamed the caller for server-side failures (SQLite I/O, etc.).
+        let err: anyhow::Error = anyhow::anyhow!("disk full");
+        let mcp = classify_tool_error(err);
+        let dbg = format!("{mcp:?}");
+        assert!(
+            dbg.contains("InternalError")
+                || dbg.contains("internal_error")
+                || dbg.contains("-32603"),
+            "plain anyhow should classify as internal_error; got {dbg}"
+        );
+    }
+
+    #[test]
+    fn bail_user_macro_produces_classifiable_error() {
+        // Ensure the convenience macro lands a ToolUserError that classify_tool_error
+        // recognises end-to-end.
+        fn rejects_zero(x: i32) -> anyhow::Result<()> {
+            if x == 0 {
+                crate::bail_user!("x must be non-zero (got {x})");
+            }
+            Ok(())
+        }
+        let err = rejects_zero(0).expect_err("should reject zero");
+        let mcp = classify_tool_error(err);
+        let dbg = format!("{mcp:?}");
+        assert!(
+            dbg.contains("InvalidParams")
+                || dbg.contains("invalid_params")
+                || dbg.contains("-32602"),
+            "bail_user! should produce an invalid_params classification; got {dbg}"
+        );
     }
 }
