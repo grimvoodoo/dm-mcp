@@ -394,10 +394,27 @@ pub fn recall(conn: &Connection, p: RecallParams) -> Result<RecallResult> {
         ));
     }
     if let Some(prefix) = &p.kind_prefix {
-        sql.push_str(" AND e.kind LIKE :kind_prefix");
+        // Cap pathological inputs (a multi-MB prefix would otherwise become a multi-MB
+        // bound parameter). 64 chars is comfortably above the longest legitimate event
+        // kind in the codebase (the deepest is `combat.next_turn` at 16 chars).
+        if prefix.chars().count() > 64 {
+            anyhow::bail!(
+                "kind_prefix must be at most 64 characters (got {})",
+                prefix.chars().count()
+            );
+        }
+        // Escape SQL LIKE wildcards in the user-supplied prefix so a caller can't
+        // pass `"%"` and match every event in the log (a value-class enumeration
+        // bypass via what's documented as a prefix filter). Use `\` as the escape
+        // char and declare it via `ESCAPE '\'` in the SQL.
+        let escaped = prefix
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_");
+        sql.push_str(r" AND e.kind LIKE :kind_prefix ESCAPE '\'");
         extra.push((
             ":kind_prefix",
-            rusqlite::types::Value::Text(format!("{prefix}%")),
+            rusqlite::types::Value::Text(format!("{escaped}%")),
         ));
     }
     if let Some(since) = p.since_hour {
@@ -814,5 +831,94 @@ mod tests {
         .unwrap();
         assert_eq!(r.role, "friendly");
         assert_eq!(r.species, "human");
+    }
+
+    #[test]
+    fn recall_kind_prefix_treats_percent_as_literal() {
+        // Regression for #33: a `%` in kind_prefix used to enable the LIKE wildcard
+        // and match every event in the log. Now escaped, so `"%"` matches only events
+        // whose kind literally starts with `%` (none).
+        let (mut conn, content) = fresh();
+        let r = generate(
+            &mut conn,
+            &content,
+            GenerateParams {
+                archetype: "orc_raider".into(),
+                zone_id: None,
+                role_override: None,
+            },
+        )
+        .unwrap();
+        // Sanity: history.* events exist for this character.
+        let real = recall(
+            &conn,
+            RecallParams {
+                character_id: r.character_id,
+                zone_id: None,
+                other_character_id: None,
+                other_item_id: None,
+                kind_prefix: Some("history.".into()),
+                since_hour: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert!(!real.events.is_empty(), "history.* prefix should match");
+
+        // Pre-fix this returned every event in the log via wildcard. Post-fix it
+        // returns nothing (no kind starts with a literal `%`).
+        let wild = recall(
+            &conn,
+            RecallParams {
+                character_id: r.character_id,
+                zone_id: None,
+                other_character_id: None,
+                other_item_id: None,
+                kind_prefix: Some("%".into()),
+                since_hour: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            wild.events.is_empty(),
+            "kind_prefix=`%` must be treated as a literal (matching no real event kinds), \
+             not as a SQL wildcard; got {} events",
+            wild.events.len()
+        );
+    }
+
+    #[test]
+    fn recall_kind_prefix_rejects_oversized_input() {
+        let (mut conn, content) = fresh();
+        let r = generate(
+            &mut conn,
+            &content,
+            GenerateParams {
+                archetype: "orc_raider".into(),
+                zone_id: None,
+                role_override: None,
+            },
+        )
+        .unwrap();
+        let huge = "x".repeat(65); // one past the cap
+        let err = recall(
+            &conn,
+            RecallParams {
+                character_id: r.character_id,
+                zone_id: None,
+                other_character_id: None,
+                other_item_id: None,
+                kind_prefix: Some(huge),
+                since_hour: None,
+                limit: None,
+            },
+        )
+        .expect_err("oversized kind_prefix should bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kind_prefix") && msg.contains("64"),
+            "error should name the field and the cap: {msg}"
+        );
     }
 }
