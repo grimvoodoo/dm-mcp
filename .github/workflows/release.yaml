@@ -10,12 +10,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Default to read-only at the workflow level. Each job below explicitly elevates
+# only the scopes it actually needs (least-privilege per the GitHub hardening
+# guide). Previously all jobs inherited contents: write + packages: write +
+# id-token: write whether they used them or not.
 permissions:
-  contents: write
-  packages: write
-  # Required by docker/build-push-action's provenance/SBOM attestations, which
-  # request an OIDC token to sign the attestation manifest.
-  id-token: write
+  contents: read
 
 # Serialise release runs on the same ref so rapid main commits don't race each
 # other computing / pushing tags. `cancel-in-progress: false` lets an in-flight
@@ -31,19 +31,21 @@ jobs:
   compute-tag:
     name: Compute Next Version Tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: read   # only reads the git history to compute the next semver tag
     outputs:
       new_tag: ${{ steps.tag.outputs.new_tag }}
       changelog: ${{ steps.tag.outputs.changelog }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3  # v6.0.0
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute next tag (dry run — tag pushed after image build)
         id: tag
-        uses: mathieudutour/github-tag-action@v6.2
+        uses: mathieudutour/github-tag-action@d28fa2ccfbd16e871a4bdf35e11b3ad1bd56c0c1  # v6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           default_bump: patch
@@ -56,6 +58,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: compute-tag
     if: needs.compute-tag.outputs.new_tag
+    permissions:
+      contents: write   # `git push origin <tag>` after image upload succeeds
+      packages: write   # ghcr push
+      id-token: write   # SLSA provenance + SBOM attestation OIDC token
     steps:
       - name: Maximize Build Space
         run: |
@@ -66,17 +72,17 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3  # v6.0.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef  # v3.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
 
       # docker/metadata-action@v6 and docker/build-push-action@v7 are JS
       # actions on the Node.js 24 runtime — require GitHub Actions runner
@@ -84,7 +90,7 @@ jobs:
       # should confirm before switching to them here.
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -97,7 +103,7 @@ jobs:
             org.opencontainers.image.licenses=MIT
 
       - name: Build and push image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7.1.0
         with:
           context: .
           file: ./Containerfile
@@ -136,9 +142,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: [compute-tag, build-and-push]
     if: needs.compute-tag.outputs.new_tag
+    permissions:
+      contents: write   # creates the GitHub Release row + uploads body
     steps:
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@aec2ec56f94eb8180ceec724245f64ef008b89f5  # v2.4.0
         with:
           tag_name: ${{ needs.compute-tag.outputs.new_tag }}
           name: Release ${{ needs.compute-tag.outputs.new_tag }}
