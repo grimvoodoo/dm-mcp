@@ -684,7 +684,7 @@ pub fn inspect(conn: &Connection, content: &Content, item_id: i64) -> Result<Ite
 
 pub fn transfer(
     conn: &mut Connection,
-    _content: &Content,
+    content: &Content,
     p: TransferParams,
 ) -> Result<TransferResult> {
     let count = p.to_character_id.is_some() as u8
@@ -697,6 +697,81 @@ pub fn transfer(
     if p.to_container_item_id == Some(p.item_id) {
         bail!("cannot transfer item {} into itself", p.item_id);
     }
+
+    // Validate that the source item exists up front so the error message is precise
+    // ("item N does not exist") rather than the FK violation we'd hit at commit time.
+    let item = read_item(conn, p.item_id)?;
+
+    // Pre-check the destination so caller-facing errors name the missing referent
+    // ("destination character N does not exist") rather than the generic UPDATE
+    // failure path. Also detects container chain cycles (A → B → A).
+    if let Some(cid) = p.to_character_id {
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM characters WHERE id = ?1", [cid], |_| {
+                Ok(true)
+            })
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            bail!("destination character {cid} does not exist");
+        }
+    }
+    if let Some(ctid) = p.to_container_item_id {
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM items WHERE id = ?1", [ctid], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            bail!("destination container item {ctid} does not exist");
+        }
+        check_no_container_cycle(conn, ctid, p.item_id)?;
+    }
+    if let Some(zid) = p.to_zone_location_id {
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM zones WHERE id = ?1", [zid], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            bail!("destination zone {zid} does not exist");
+        }
+    }
+
+    // For character destinations, mirror pickup's overload guard. Without this,
+    // transfer is the asymmetric loophole that lets any character receive any item
+    // regardless of how heavy it is — silently ignoring the encumbrance contract that
+    // pickup enforces. Also pre-compute the post-transfer percentage so the encumbered
+    // condition gets the right state inside the tx.
+    let dest_char_overload: Option<(i64, f64, f64, i32)> = if let Some(cid) = p.to_character_id {
+        let (str_score,): (i32,) = conn
+            .query_row(
+                "SELECT str_score FROM characters WHERE id = ?1",
+                [cid],
+                |row| Ok((row.get(0)?,)),
+            )
+            .with_context(|| format!("character {cid} not found"))?;
+        let capacity = (str_score as f64) * (content.encumbrance.capacity_per_str as f64);
+        let item_weight = effective_weight_for_item(&item, content);
+        // If the item is already held by this character, transferring it back to them is
+        // a no-op weight-wise; only count weight when the holder actually changes.
+        let weight_delta = if item.holder_character_id == Some(cid) {
+            0.0
+        } else {
+            item_weight
+        };
+        let current_carried = carried_weight_lb(conn, content, cid)?;
+        let would_be = current_carried + weight_delta;
+        let overloaded_limit =
+            capacity * (content.encumbrance.overloaded_threshold_pct as f64) / 100.0;
+        if would_be > overloaded_limit {
+            bail!(
+                "transfer to character {cid} would overload them ({would_be:.2} lb carried of {capacity:.2} capacity); use inventory.pickup or drop weight first"
+            );
+        }
+        let would_pct = pct_of_capacity(would_be, capacity);
+        Some((cid, would_be, capacity, would_pct))
+    } else {
+        None
+    };
 
     let now = crate::world::current_campaign_hour(conn)?;
     let tx = conn.transaction().context("begin transfer tx")?;
@@ -752,11 +827,70 @@ pub fn transfer(
             }],
         },
     )?;
+    // For character destinations, recompute encumbrance inside the same tx so the
+    // 'encumbered' condition matches the post-transfer state. Mirrors the pickup path.
+    if let Some((cid, _would_be, _capacity, would_pct)) = dest_char_overload {
+        apply_encumbered_in_tx(&tx, content, cid, would_pct, now)?;
+    }
+    // Also re-evaluate the SOURCE holder's encumbrance if the item moved off a holder.
+    // Without this, removing weight from a previously-encumbered character wouldn't
+    // clear the condition.
+    if let Some(prev_holder) = item.holder_character_id {
+        if Some(prev_holder) != p.to_character_id {
+            // Recompute their carried weight + percentage post-transfer.
+            let (str_score,): (i32,) = tx
+                .query_row(
+                    "SELECT str_score FROM characters WHERE id = ?1",
+                    [prev_holder],
+                    |row| Ok((row.get(0)?,)),
+                )
+                .with_context(|| format!("source holder {prev_holder} disappeared"))?;
+            let capacity = (str_score as f64) * (content.encumbrance.capacity_per_str as f64);
+            let new_carried = carried_weight_lb(&tx, content, prev_holder)?;
+            let new_pct = pct_of_capacity(new_carried, capacity);
+            apply_encumbered_in_tx(&tx, content, prev_holder, new_pct, now)?;
+        }
+    }
     tx.commit().context("commit transfer tx")?;
     Ok(TransferResult {
         item_id: p.item_id,
         event_id: emitted.event_id,
     })
+}
+
+/// Walk the container chain upward from `start_container`, bailing if `item_being_moved`
+/// is already an ancestor (which would create a cycle once the move is applied) or if
+/// we exceed a safety depth. Lazy traversal — stops at the first NULL parent or root
+/// holder/zone reference.
+fn check_no_container_cycle(
+    conn: &Connection,
+    start_container: i64,
+    item_being_moved: i64,
+) -> Result<()> {
+    let mut current: Option<i64> = Some(start_container);
+    let mut steps: u32 = 0;
+    while let Some(cid) = current {
+        if cid == item_being_moved {
+            bail!(
+                "transferring item {item_being_moved} into container {start_container} would create a cycle (item is already an ancestor of the container)"
+            );
+        }
+        steps += 1;
+        if steps > 32 {
+            bail!(
+                "container chain depth from {start_container} exceeds 32 — refusing to walk further (probable existing cycle in data)"
+            );
+        }
+        current = conn
+            .query_row(
+                "SELECT container_item_id FROM items WHERE id = ?1",
+                [cid],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+    Ok(())
 }
 
 fn describe_destination(p: &TransferParams) -> String {
