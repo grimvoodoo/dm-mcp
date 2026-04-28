@@ -761,3 +761,164 @@ async fn non_stackable_create_with_quantity_errors() -> Result<()> {
     h.client.cancel().await?;
     Ok(())
 }
+
+// ── E2E 9: inventory.transfer destination/cycle/overload validation (#30) ──
+
+#[tokio::test]
+async fn transfer_to_nonexistent_character_returns_clear_error() -> Result<()> {
+    use rmcp::model::CallToolRequestParams;
+    let h = connect().await?;
+    let alice = make_char(&h.client, "Alice", 10, 10, None).await?;
+    let item = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({"base_kind": "longsword", "holder_character_id": alice}),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+
+    let args = serde_json::json!({"item_id": item, "to_character_id": 99_999});
+    let params = CallToolRequestParams::new("inventory.transfer")
+        .with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(e) => assert!(
+            format!("{e}").contains("does not exist"),
+            "JSON-RPC error should name the missing destination; got {e:?}"
+        ),
+        Ok(result) => assert_eq!(
+            result.is_error,
+            Some(true),
+            "transferring to a nonexistent character must signal error; got {result:?}"
+        ),
+    }
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn transfer_into_self_via_container_chain_rejected() -> Result<()> {
+    // A → B → C; transferring A into C creates A → B → C → A. Walk parent chain
+    // upward from the destination, bail if we encounter the source.
+    use rmcp::model::CallToolRequestParams;
+    let h = connect().await?;
+    let alice = make_char(&h.client, "Alice", 10, 10, None).await?;
+    // Three nested containers: a → b → c (chain a->b means a is INSIDE b).
+    let a = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({"base_kind": "heavy_crate", "holder_character_id": alice}),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+    let b = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({"base_kind": "heavy_crate", "holder_character_id": alice}),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+    let c = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({"base_kind": "heavy_crate", "holder_character_id": alice}),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+
+    // Build the chain: put a inside b, then b inside c. (a's container = b; b's container = c.)
+    call(
+        &h.client,
+        "inventory.transfer",
+        serde_json::json!({"item_id": a, "to_container_item_id": b}),
+    )
+    .await?;
+    call(
+        &h.client,
+        "inventory.transfer",
+        serde_json::json!({"item_id": b, "to_container_item_id": c}),
+    )
+    .await?;
+
+    // Now try to put c inside a → would form a cycle (c → a → b → c).
+    let args = serde_json::json!({"item_id": c, "to_container_item_id": a});
+    let params = CallToolRequestParams::new("inventory.transfer")
+        .with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(e) => assert!(
+            format!("{e}").contains("cycle"),
+            "cycle error should be named explicitly; got {e:?}"
+        ),
+        Ok(result) => {
+            assert_eq!(result.is_error, Some(true), "got {result:?}");
+            let txt = result
+                .content
+                .iter()
+                .find_map(|c| match &c.raw {
+                    rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            // The structured tool error body or the message should mention "cycle".
+            assert!(
+                format!("{result:?}").contains("cycle") || txt.contains("cycle"),
+                "cycle error should be named; got result={result:?}, body={txt}"
+            );
+        }
+    }
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn transfer_to_overloaded_character_refused() -> Result<()> {
+    // Recipient is STR 10 (capacity 150 lb). A 100 lb crate already on them puts them
+    // at 66%. Transferring a SECOND 100 lb crate would push them to 200 lb / 150 = 133%
+    // — over the 100% overloaded threshold.
+    use rmcp::model::CallToolRequestParams;
+    let h = connect().await?;
+    let alice = make_char(&h.client, "Alice", 10, 10, None).await?;
+    let bob = make_char(&h.client, "Bob", 10, 10, None).await?;
+
+    let crate1 = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({"base_kind": "heavy_crate", "holder_character_id": bob}),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+    let crate2 = call(
+        &h.client,
+        "inventory.create",
+        serde_json::json!({"base_kind": "heavy_crate", "holder_character_id": alice}),
+    )
+    .await?["item_id"]
+        .as_i64()
+        .unwrap();
+    // Sanity: bob is holding crate1 already (66% of 150).
+    let _ = crate1;
+
+    let args = serde_json::json!({"item_id": crate2, "to_character_id": bob});
+    let params = CallToolRequestParams::new("inventory.transfer")
+        .with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(e) => assert!(
+            format!("{e}").contains("overload"),
+            "overload error should be named; got {e:?}"
+        ),
+        Ok(result) => assert_eq!(
+            result.is_error,
+            Some(true),
+            "transferring to overloaded recipient must signal error; got {result:?}"
+        ),
+    }
+    h.client.cancel().await?;
+    Ok(())
+}
