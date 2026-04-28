@@ -160,6 +160,13 @@ CREATE TABLE IF NOT EXISTS character_resources (
                      ('short_rest','long_rest','dawn','never','manual')),
     PRIMARY KEY (character_id, name)
 );
+-- rests::do_rest filters resources by (character_id, recharge) on every short/long
+-- rest. The PK on (character_id, name) lets SQLite use the prefix for character_id
+-- but then has to scan every resource row for that character and filter by recharge
+-- in memory. This composite index covers the WHERE so the scan stops at the matching
+-- recharge bucket directly.
+CREATE INDEX IF NOT EXISTS idx_character_resources_recharge
+    ON character_resources(character_id, recharge);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Conditions: named states with mechanical riders (defined in content, not here).
@@ -571,5 +578,58 @@ mod tests {
             [],
         )
         .expect("item referencing real zone should be accepted");
+    }
+
+    #[test]
+    fn character_resources_recharge_index_exists_and_is_used() {
+        // Regression for #39: rests::do_rest filters character_resources by
+        // (character_id, recharge) on every short/long rest. Without this composite
+        // index SQLite scans every resource row for the character.
+        let mut conn = in_memory();
+        migrate(&mut conn).expect("migrate");
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='idx_character_resources_recharge'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        assert_eq!(exists, 1, "idx_character_resources_recharge should exist");
+
+        // Verify the planner actually uses it for the rest-time query.
+        // Need a character row so the planner can plan against the table.
+        conn.execute(
+            "INSERT INTO characters (
+                id, name, role,
+                str_score, dex_score, con_score, int_score, wis_score, cha_score,
+                hp_current, hp_max, hp_temp,
+                armor_class, speed_ft, initiative_bonus,
+                size, created_at, updated_at
+             ) VALUES (
+                1, 'X', 'player',
+                10, 10, 10, 10, 10, 10,
+                10, 10, 0,
+                10, 30, 0,
+                'medium', 0, 0
+             )",
+            [],
+        )
+        .expect("seed character");
+
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT name, current, max FROM character_resources
+                 WHERE character_id = 1 AND recharge = 'short_rest'",
+                [],
+                |r| r.get(3),
+            )
+            .expect("explain");
+        assert!(
+            plan.contains("idx_character_resources_recharge"),
+            "rest query should use the new index; got {plan:?}"
+        );
     }
 }
