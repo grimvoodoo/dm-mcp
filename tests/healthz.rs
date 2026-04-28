@@ -106,3 +106,84 @@ async fn healthz_returns_ok_on_repeated_calls() -> anyhow::Result<()> {
     child.kill().await?;
     Ok(())
 }
+
+// ── Regression tests for #28 (HTTP transport hardening) ────────────────────
+
+async fn spawn_http_with_env(
+    port: u16,
+    db_path: &std::path::Path,
+    extra_env: &[(&str, String)],
+) -> anyhow::Result<Child> {
+    let mut cmd = Command::new(bin_path());
+    cmd.arg("http")
+        .env("DMMCP_HTTP_BIND", "127.0.0.1")
+        .env("DMMCP_HTTP_PORT", port.to_string())
+        .env("DMMCP_LOG_LEVEL", "warn")
+        .env("DMMCP_DB_PATH", db_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    Ok(cmd.spawn()?)
+}
+
+#[tokio::test]
+async fn mcp_endpoint_rejects_unauth_when_token_set() -> anyhow::Result<()> {
+    // With DMMCP_HTTP_AUTH_TOKEN set, requests to /mcp must carry the bearer token
+    // or get 401. /healthz remains unauthenticated (k8s probes need to reach it).
+    let tmp = TempDir::new()?;
+    let db_path = tmp.path().join("campaign.db");
+    let port = test_port() + 100;
+    let token = "test-secret-token-do-not-leak";
+    let mut child =
+        spawn_http_with_env(port, &db_path, &[("DMMCP_HTTP_AUTH_TOKEN", token.into())]).await?;
+
+    // Wait for the server to come up via /healthz (still unauth).
+    let healthz = format!("http://127.0.0.1:{port}/healthz");
+    wait_for_healthz(&healthz, Duration::from_secs(10)).await?;
+
+    let client = reqwest::Client::new();
+    let mcp_url = format!("http://127.0.0.1:{port}/mcp");
+
+    // No token → 401.
+    let unauth = client.post(&mcp_url).body("{}").send().await?;
+    assert_eq!(unauth.status(), 401, "no-token request must be rejected");
+
+    // Wrong token → 401.
+    let wrong = client
+        .post(&mcp_url)
+        .header("Authorization", "Bearer not-the-token")
+        .body("{}")
+        .send()
+        .await?;
+    assert_eq!(wrong.status(), 401, "wrong-token request must be rejected");
+
+    // Right token → not 401 (will be a 4xx for malformed MCP content, but auth passed).
+    let authed = client
+        .post(&mcp_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .body("{}")
+        .send()
+        .await?;
+    assert_ne!(
+        authed.status(),
+        401,
+        "valid-token request must pass through auth (got 401)"
+    );
+
+    child.kill().await?;
+    Ok(())
+}
+
+// Note on body-limit testing: `axum::extract::DefaultBodyLimit` only fires when an
+// extractor (Bytes / Json / Form) reads the body. rmcp's StreamableHttpService rejects
+// requests whose Content-Type/Accept headers don't match its expected MCP shape *before*
+// reading the body, so an oversized request with the wrong headers gets a 415/406 from
+// rmcp without the body limit ever tripping. The protection is still in place — anyone
+// hitting `/mcp` with proper headers + an oversized body will get 413 — but exercising
+// it from a test requires standing up a full MCP session, which the existing rmcp
+// transport-child-process tests do but don't expose body-control hooks for. Coverage
+// gap acknowledged; defer to a future test that drives the full MCP handshake.
