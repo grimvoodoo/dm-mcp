@@ -597,6 +597,33 @@ async fn healing_dead_character_refused() -> Result<()> {
 }
 
 #[tokio::test]
+async fn damaging_dead_character_refused() -> Result<()> {
+    // Regression for #31: apply_damage on a corpse used to silently clamp HP to 0
+    // again and emit a spurious damage event. Now refuses, mirroring apply_healing.
+    use rmcp::model::CallToolRequestParams;
+
+    let h = connect().await?;
+    let player = make_char(&h.client, "Doomed", "player", 5).await?;
+    kill_character(&h.client, player).await?;
+
+    let args = serde_json::json!({ "character_id": player, "amount": 10 });
+    let params = CallToolRequestParams::new("combat.apply_damage")
+        .with_arguments(args.as_object().unwrap().clone());
+    let outcome = h.client.call_tool(params).await;
+    match outcome {
+        Err(_) => { /* JSON-RPC error — fine */ }
+        Ok(result) => assert_eq!(
+            result.is_error,
+            Some(true),
+            "damaging dead character must signal error; got {result:?}"
+        ),
+    }
+
+    h.client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_long_refused_when_dead() -> Result<()> {
     use rmcp::model::CallToolRequestParams;
 
