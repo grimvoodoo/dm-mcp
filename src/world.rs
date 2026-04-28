@@ -282,17 +282,23 @@ pub fn map(conn: &Connection, p: MapParams) -> Result<MapResult> {
             origin_zone_id
         );
     }
+    // Pre-load every outgoing edge from any zone the character knows about in a single
+    // query, then drive both the BFS and the connections build off the in-memory map.
+    // Replaces the previous N+1 patterns (one read_outgoing_edges call per known zone,
+    // twice — once for BFS, once for connections). Hot path on every world.map call.
+    let known_ids_vec: Vec<i64> = known.keys().copied().collect();
+    let edges_by_from = read_outgoing_edges_for_zones(conn, &known_ids_vec)?;
+
     let mut positions: BTreeMap<i64, (i32, i32)> = BTreeMap::new();
     positions.insert(origin_zone_id, (0, 0));
 
     let mut queue: VecDeque<i64> = VecDeque::new();
     queue.push_back(origin_zone_id);
 
-    // Adjacency: for the BFS, fetch all outgoing edges from the seed and from any zone
-    // we expand. Cheap for Phase 7-scale graphs.
     while let Some(zid) = queue.pop_front() {
         let (cx, cy) = positions[&zid];
-        let edges = read_outgoing_edges(conn, zid)?;
+        let empty = Vec::new();
+        let edges = edges_by_from.get(&zid).unwrap_or(&empty);
         for e in edges {
             // Only walk into known zones.
             if !known.contains_key(&e.to_zone_id) {
@@ -334,16 +340,19 @@ pub fn map(conn: &Connection, p: MapParams) -> Result<MapResult> {
         });
     }
 
-    // Connections: only between zones both known (rumored at minimum).
+    // Connections: only between zones both known (rumored at minimum). Reuses the same
+    // pre-loaded edge map as the BFS — no further queries.
     let known_ids: std::collections::HashSet<i64> = zones.iter().map(|z| z.id).collect();
     let mut connections = Vec::new();
     for zid in &known_ids {
-        for e in read_outgoing_edges(conn, *zid)? {
+        let empty = Vec::new();
+        let edges = edges_by_from.get(zid).unwrap_or(&empty);
+        for e in edges {
             if known_ids.contains(&e.to_zone_id) {
                 connections.push(MapConnection {
                     from_zone_id: *zid,
                     to_zone_id: e.to_zone_id,
-                    direction_from: e.direction_from,
+                    direction_from: e.direction_from.clone(),
                     travel_time_hours: e.travel_time_hours,
                     one_way: e.one_way,
                 });
@@ -556,6 +565,58 @@ fn read_outgoing_edges(conn: &Connection, from: i64) -> Result<Vec<EdgeRow>> {
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Batched variant of [`read_outgoing_edges`]: load every outgoing edge from the given
+/// set of zones in a single query and return them grouped by `from_zone_id`. Used by
+/// `world::map` to replace what was an N+1 loop (one prepared-statement query per
+/// known zone) with one round-trip. Hot path on every call to `world.map`.
+///
+/// The IN list is built from server-controlled `i64` values (the character's known-zone
+/// set, sourced from `character_zone_knowledge`), so there's no injection vector despite
+/// using `format!` to compose the placeholder list.
+fn read_outgoing_edges_for_zones(
+    conn: &Connection,
+    from_ids: &[i64],
+) -> Result<BTreeMap<i64, Vec<EdgeRow>>> {
+    if from_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = (1..=from_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT from_zone_id, to_zone_id, direction_from, travel_time_hours, one_way
+         FROM zone_connections WHERE from_zone_id IN ({placeholders})"
+    );
+    let bound: Vec<&dyn rusqlite::ToSql> = from_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(bound.as_slice(), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            EdgeRow {
+                to_zone_id: row.get(1)?,
+                direction_from: row.get(2)?,
+                travel_time_hours: row.get(3)?,
+                one_way: row.get::<_, i64>(4)? != 0,
+            },
+        ))
+    })?;
+    let mut out: BTreeMap<i64, Vec<EdgeRow>> = BTreeMap::new();
+    for r in rows {
+        let (from, edge) = r?;
+        out.entry(from).or_default().push(edge);
+    }
+    // Empty entries for from_ids with no outgoing edges so callers can rely on a
+    // present-but-empty Vec rather than special-casing missing keys.
+    for id in from_ids {
+        out.entry(*id).or_default();
     }
     Ok(out)
 }
