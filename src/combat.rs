@@ -599,6 +599,18 @@ pub fn apply_damage(conn: &mut Connection, p: ApplyDamageParams) -> Result<Apply
         )
         .with_context(|| format!("character {} not found", p.character_id))?;
 
+    // Symmetric with apply_healing's dead-character guard (line 723). Without this,
+    // damage on a corpse silently clamped HP to 0 again and emitted a spurious
+    // damage event — confusing event-log analytics and letting a buggy or malicious
+    // caller spam the log. If a future tool wants "desecrate corpse" semantics it
+    // should be a separate event kind, not a silent overload of apply_damage.
+    if status == "dead" {
+        bail!(
+            "character {} is dead and cannot take damage",
+            p.character_id
+        );
+    }
+
     let new_hp = (hp_current - p.amount).max(0);
     let hits_zero = hp_current > 0 && new_hp == 0;
     let now = crate::world::current_campaign_hour(conn)?;
