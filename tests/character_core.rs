@@ -9,66 +9,10 @@
 //! Additional tests cover update_plans / change_role / proficiencies / resources.
 
 use anyhow::{Context, Result};
-use rmcp::model::{CallToolRequestParams, RawContent};
-use rmcp::transport::TokioChildProcess;
-use rmcp::ServiceExt;
 use rusqlite::Connection;
-use tempfile::TempDir;
-use tokio::process::Command;
 
-fn bin_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_dm-mcp"))
-}
-
-struct Harness {
-    _tmp: TempDir,
-    db_path: std::path::PathBuf,
-    client: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-}
-
-async fn connect() -> Result<Harness> {
-    let tmp = TempDir::new()?;
-    let db_path = tmp.path().join("campaign.db");
-    let mut cmd = Command::new(bin_path());
-    cmd.arg("stdio");
-    cmd.env("DMMCP_LOG_LEVEL", "warn");
-    cmd.env("DMMCP_DB_PATH", &db_path);
-    let transport = TokioChildProcess::new(cmd).context("spawn child")?;
-    let client = ().serve(transport).await.context("mcp handshake")?;
-    Ok(Harness {
-        _tmp: tmp,
-        db_path,
-        client,
-    })
-}
-
-/// Invoke a tool with the given JSON args and parse the text payload as JSON.
-async fn call(
-    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    name: &str,
-    args: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let obj = args.as_object().cloned().unwrap_or_default();
-    let params = CallToolRequestParams::new(name.to_string()).with_arguments(obj);
-    let result = client
-        .call_tool(params)
-        .await
-        .with_context(|| format!("call {name}"))?;
-    assert!(
-        result.is_error != Some(true),
-        "{name} signalled error: {:?}",
-        result
-    );
-    let text = result
-        .content
-        .iter()
-        .find_map(|item| match &item.raw {
-            RawContent::Text(t) => Some(t.text.clone()),
-            _ => None,
-        })
-        .context("expected text content")?;
-    serde_json::from_str(&text).with_context(|| format!("{name} payload: {text}"))
-}
+mod common;
+use common::{call, connect};
 
 /// Collect every event kind that referenced the given character, in insertion order. Reads
 /// the SQLite file directly — the server is still running but SQLite's WAL mode lets a
