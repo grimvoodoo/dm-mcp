@@ -334,8 +334,18 @@ fn emit_bargain_event_in_tx(
 }
 
 fn derive_dc(ratio: f64) -> i32 {
+    // Defensive: handle NaN and Infinity from upstream (e.g. requested_value == 0.0
+    // produces ratio = INF). NaN clamps via comparison-fail to FAIR_RATIO (DC base);
+    // Infinity clamps to a sane high ratio so the gap never goes negative-overflow.
+    // Without this, `(NaN * 100.0 / 10.0).ceil() as i32` is implementation-defined
+    // and `Infinity.ceil() as i32` saturates at i32::MAX.
+    let r = if ratio.is_nan() {
+        FAIR_RATIO
+    } else {
+        ratio.clamp(0.0, 2.0)
+    };
     // Ratio 0.9 → DC 10. Each 10% gap below 0.9 adds 2. Ratio 0.5 → DC 18.
-    let gap = (FAIR_RATIO - ratio).max(0.0);
+    let gap = (FAIR_RATIO - r).max(0.0);
     DC_BASE + ((gap * 100.0 / 10.0).ceil() as i32) * DC_PER_10PCT_GAP
 }
 
@@ -597,5 +607,32 @@ mod tests {
         .unwrap();
         assert_eq!(r.resolution, "refused");
         assert_eq!(r.outcome, "declined");
+    }
+
+    #[test]
+    fn derive_dc_handles_nan_and_infinity_gracefully() {
+        // NaN: clamps to FAIR_RATIO so the result is the base DC, not implementation-
+        // defined integer-from-NaN. (FAIR_RATIO is the no-gap point — DC equals BASE.)
+        let nan_dc = derive_dc(f64::NAN);
+        assert_eq!(nan_dc, DC_BASE, "NaN ratio should fall back to base DC");
+
+        // Infinity: would otherwise feed `(neg_gap * 100 / 10).ceil() as i32` which
+        // saturates at i32::MAX. The clamp to [0.0, 2.0] caps it at FAIR_RATIO+,
+        // so DC again equals BASE (gap = 0).
+        let inf_dc = derive_dc(f64::INFINITY);
+        assert_eq!(
+            inf_dc, DC_BASE,
+            "infinite ratio (free request) should fall back to base DC"
+        );
+
+        // Negative ratio (shouldn't happen but cheap to defend): clamps to 0.0,
+        // yielding the maximum-gap DC. Compute the expected via the same formula:
+        // gap = FAIR_RATIO - 0.0 = 0.9 → 9 chunks of 10% → DC = base + 9 * step.
+        let zero_dc = derive_dc(-1.0);
+        let expected = DC_BASE + (((FAIR_RATIO * 100.0 / 10.0).ceil() as i32) * DC_PER_10PCT_GAP);
+        assert_eq!(
+            zero_dc, expected,
+            "negative ratio should clamp to 0.0 producing max-gap DC"
+        );
     }
 }
