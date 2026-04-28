@@ -38,6 +38,15 @@ pub struct DbConfig {
 pub struct HttpConfig {
     pub bind: IpAddr,
     pub port: u16,
+    /// Optional bearer token. If set, requests to `/mcp` must carry
+    /// `Authorization: Bearer <token>` (constant-time compared) or get a 401.
+    /// Unset (the default) means no auth — only safe for loopback or trusted
+    /// network deployments.
+    pub auth_token: Option<String>,
+    /// Maximum body size for `/mcp` POSTs. Defaults to 1 MiB. Tunable via
+    /// `DMMCP_HTTP_MAX_BODY_BYTES`. Defends against an oversized POST OOMing
+    /// the process.
+    pub max_body_bytes: usize,
 }
 
 impl HttpConfig {
@@ -68,8 +77,17 @@ impl Config {
                 cache_size: env_or("DMMCP_DB_CACHE_SIZE", -32_768_i64, parse_str)?,
             },
             http: HttpConfig {
-                bind: env_or("DMMCP_HTTP_BIND", IpAddr::from([0, 0, 0, 0]), parse_str)?,
+                // Default loopback (#28) — single-tenant project per CLAUDE.md.
+                // Operators that need network exposure set DMMCP_HTTP_BIND=0.0.0.0
+                // explicitly. Was 0.0.0.0 before — that change is documented in
+                // the PR / README "Configuration" section.
+                bind: env_or("DMMCP_HTTP_BIND", IpAddr::from([127, 0, 0, 1]), parse_str)?,
                 port: env_or("DMMCP_HTTP_PORT", 3000_u16, parse_str)?,
+                auth_token: match env::var("DMMCP_HTTP_AUTH_TOKEN") {
+                    Ok(v) if !v.is_empty() => Some(v),
+                    _ => None,
+                },
+                max_body_bytes: env_or("DMMCP_HTTP_MAX_BODY_BYTES", 1_048_576_usize, parse_str)?,
             },
             log_level: env_or("DMMCP_LOG_LEVEL", "info".to_string(), parse_log_level)?,
             content_dir: match env::var("DMMCP_CONTENT_DIR") {
@@ -167,6 +185,8 @@ mod tests {
             "DMMCP_DB_CACHE_SIZE",
             "DMMCP_HTTP_BIND",
             "DMMCP_HTTP_PORT",
+            "DMMCP_HTTP_AUTH_TOKEN",
+            "DMMCP_HTTP_MAX_BODY_BYTES",
             "DMMCP_LOG_LEVEL",
             "DMMCP_CONTENT_DIR",
         ];
@@ -186,7 +206,11 @@ mod tests {
             assert_eq!(cfg.db.synchronous, "NORMAL");
             assert_eq!(cfg.db.mmap_size, 67_108_864);
             assert_eq!(cfg.db.cache_size, -32_768);
-            assert_eq!(cfg.http.bind, IpAddr::from([0, 0, 0, 0]));
+            // Default is loopback (#28) — single-tenant safe default. Operators that
+            // need network exposure set DMMCP_HTTP_BIND=0.0.0.0 explicitly.
+            assert_eq!(cfg.http.bind, IpAddr::from([127, 0, 0, 1]));
+            assert_eq!(cfg.http.auth_token, None);
+            assert_eq!(cfg.http.max_body_bytes, 1_048_576);
             assert_eq!(cfg.http.port, 3000);
             assert_eq!(cfg.log_level, "info");
             assert!(cfg.content_dir.is_none());

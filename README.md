@@ -107,9 +107,11 @@ Every performance knob has a low-latency default and is overridable via environm
 | `DMMCP_DB_SYNCHRONOUS`    | `NORMAL`        | SQLite `synchronous` PRAGMA. Durable across crashes; meaningfully faster than `FULL` under WAL |
 | `DMMCP_DB_MMAP_SIZE`      | `67108864`      | SQLite `mmap_size` PRAGMA, bytes. Default 64 MB; raise to 256 MB+ on larger hosts      |
 | `DMMCP_DB_CACHE_SIZE`     | `-32768`        | SQLite `cache_size` PRAGMA. Negative values are kilobytes; default is 32 MB            |
-| `DMMCP_HTTP_BIND`         | `0.0.0.0`       | HTTP bind address                                                                      |
+| `DMMCP_HTTP_BIND`         | `127.0.0.1`     | HTTP bind address. Loopback by default — set to `0.0.0.0` for networked deploys        |
 | `DMMCP_HTTP_PORT`         | `3000`          | HTTP port                                                                              |
-| `DMMCP_LOG_LEVEL`         | `info`          | `tracing` log level (`trace`/`debug`/`info`/`warn`/`error`)                            |
+| `DMMCP_HTTP_AUTH_TOKEN`   | (unset)         | Bearer token for `/mcp`. Required header: `Authorization: Bearer <token>`. Unset → no auth |
+| `DMMCP_HTTP_MAX_BODY_BYTES` | `1048576` (1 MiB) | Max request body size for `/mcp`                                                       |
+| `DMMCP_LOG_LEVEL`         | `info`          | `tracing` log level (`trace`/`debug`/`info`/`warn`/`error`) or per-target directive    |
 | `DMMCP_CONTENT_DIR`       | *(unset)*       | When set, loads bundled YAML content from disk instead of the baked-in copy            |
 
 `foreign_keys = ON` is hard-coded — correctness, not tuning.
