@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::content::Content;
 use crate::events::{self, EventSpec, Participant};
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -64,12 +65,29 @@ pub struct RemoveConditionResult {
 }
 
 /// Record a condition on a character and emit `condition.applied`.
-pub fn apply(conn: &mut Connection, p: ApplyConditionParams) -> Result<ApplyConditionResult> {
+pub fn apply(
+    conn: &mut Connection,
+    content: &Content,
+    p: ApplyConditionParams,
+) -> Result<ApplyConditionResult> {
     if p.condition.is_empty() {
         bail!("condition name must not be empty");
     }
     if p.severity < 1 {
         bail!("condition severity must be >= 1 (got {})", p.severity);
+    }
+    // Reject unknown condition names. Without this, a typo silently produces a row
+    // whose mechanical riders (disadvantage, auto-fail saves, etc.) never fire because
+    // resolve_check looks them up by name. The catalog is small (12 entries) so the
+    // diagnostic listing every valid name is bounded.
+    if !content.conditions.contains_key(p.condition.as_str()) {
+        let mut valid: Vec<&str> = content.conditions.keys().map(String::as_str).collect();
+        valid.sort();
+        bail!(
+            "unknown condition {:?}; valid conditions: {:?}",
+            p.condition,
+            valid
+        );
     }
 
     // Emit the event first so the source_event_id FK resolves once we write the row.
@@ -203,11 +221,11 @@ mod tests {
     use crate::characters::{self, CreateParams};
     use crate::db::schema;
 
-    fn fresh_conn() -> Connection {
+    fn fresh() -> (Connection, Content) {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         schema::migrate(&mut conn).unwrap();
-        conn
+        (conn, Content::load(None).unwrap())
     }
 
     fn make_char(conn: &mut Connection) -> i64 {
@@ -244,10 +262,11 @@ mod tests {
 
     #[test]
     fn apply_and_remove_round_trip() {
-        let mut conn = fresh_conn();
+        let (mut conn, content) = fresh();
         let c = make_char(&mut conn);
         let applied = apply(
             &mut conn,
+            &content,
             ApplyConditionParams {
                 character_id: c,
                 condition: "blinded".into(),
@@ -288,10 +307,11 @@ mod tests {
 
     #[test]
     fn double_remove_errors() {
-        let mut conn = fresh_conn();
+        let (mut conn, content) = fresh();
         let c = make_char(&mut conn);
         let applied = apply(
             &mut conn,
+            &content,
             ApplyConditionParams {
                 character_id: c,
                 condition: "poisoned".into(),
@@ -320,5 +340,39 @@ mod tests {
         )
         .expect_err("double remove should fail");
         assert!(format!("{err:#}").contains("already inactive"));
+    }
+
+    #[test]
+    fn apply_rejects_unknown_condition_name() {
+        // A typo like "paralised" used to silently insert a row whose mechanical
+        // riders never fire downstream. After the validate fix, the apply call
+        // bails up front and lists the valid set.
+        let (mut conn, content) = fresh();
+        let c = make_char(&mut conn);
+        let err = apply(
+            &mut conn,
+            &content,
+            ApplyConditionParams {
+                character_id: c,
+                condition: "paralised".into(), // misspelled "paralyzed"
+                severity: 1,
+                source_event_id: None,
+                expires_at_hour: None,
+                expires_after_rounds: None,
+                remove_on_save: None,
+            },
+        )
+        .expect_err("unknown condition name should bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("paralised") && msg.contains("unknown"),
+            "error should name the offender and the valid set: {msg}"
+        );
+        // Sanity: the message does include a real condition like "paralyzed" so
+        // a confused caller can spot the typo.
+        assert!(
+            msg.contains("paralyzed"),
+            "error should list a real condition for comparison: {msg}"
+        );
     }
 }

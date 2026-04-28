@@ -797,6 +797,7 @@ mod tests {
         let c = make_char(&mut conn, 14);
         conditions::apply(
             &mut conn,
+            &content,
             ApplyConditionParams {
                 character_id: c,
                 condition: "blinded".into(),
@@ -838,6 +839,7 @@ mod tests {
         // Apply blinded (self-disadvantage on attack_rolls) AND pass advantage via caller.
         conditions::apply(
             &mut conn,
+            &content,
             ApplyConditionParams {
                 character_id: c,
                 condition: "blinded".into(),

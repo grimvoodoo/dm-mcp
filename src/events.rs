@@ -57,8 +57,17 @@ pub struct EmittedEvent {
 /// the calling tool needs to bundle DB writes plus the event into a single atomic unit
 /// (e.g. setup::generate_world creating zones + emitting world.generated). The caller owns
 /// the transaction and must commit it.
+/// Hard cap on the `summary` text written to the events table. Several callers format
+/// user-influenced strings (condition names, effect sources, character names) into the
+/// summary via `format!`. A maliciously- or accidentally-long input would otherwise
+/// land verbatim in every event row, bloating the WAL and slowing recall queries.
+/// 1 KiB is comfortably above the longest legitimate summary in the codebase
+/// (`condition.applied`, `combat.apply_damage` etc. are all < 200 chars).
+const MAX_SUMMARY_BYTES: usize = 1024;
+
 pub fn emit_in_tx(tx: &Transaction<'_>, spec: &EventSpec<'_>) -> Result<EmittedEvent> {
     let payload = serde_json::to_string(&spec.payload).context("serialize payload")?;
+    let summary = truncate_summary(&spec.summary);
 
     tx.execute(
         "INSERT INTO events
@@ -71,7 +80,7 @@ pub fn emit_in_tx(tx: &Transaction<'_>, spec: &EventSpec<'_>) -> Result<EmittedE
             spec.zone_id,
             spec.encounter_id,
             spec.parent_id,
-            spec.summary,
+            summary,
             payload,
         ],
     )
@@ -114,6 +123,28 @@ pub fn emit(conn: &mut Connection, spec: &EventSpec<'_>) -> Result<EmittedEvent>
     let result = emit_in_tx(&tx, spec)?;
     tx.commit().context("commit event tx")?;
     Ok(result)
+}
+
+/// Cap `summary` to `MAX_SUMMARY_BYTES`, truncating on a UTF-8 char boundary so the
+/// resulting string is still valid (`String::truncate` panics on a non-boundary, and
+/// SQLite would happily store half a multi-byte sequence). If truncated, append a
+/// trailing `…` so a reader sees the cut-off rather than thinking the string ends mid-
+/// word. Operates on `&str` and returns owned only when truncation is needed.
+fn truncate_summary(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_SUMMARY_BYTES {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    // Find the last char boundary at or before MAX_SUMMARY_BYTES - 3 (room for "…",
+    // which is 3 UTF-8 bytes). is_char_boundary works on byte indices.
+    let target = MAX_SUMMARY_BYTES.saturating_sub(3);
+    let mut cut = target;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(MAX_SUMMARY_BYTES);
+    out.push_str(&s[..cut]);
+    out.push('…');
+    std::borrow::Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -255,5 +286,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn long_summary_is_truncated_with_ellipsis() {
+        // A pathological summary (e.g. someone passing a 1MB condition source name)
+        // shouldn't land verbatim in events.summary. The cap defends WAL size +
+        // recall query latency.
+        let mut conn = fresh_conn();
+        let kira = insert_character(&conn, "Kira");
+        let huge = "x".repeat(MAX_SUMMARY_BYTES + 200);
+        let spec = EventSpec {
+            kind: "test.long",
+            campaign_hour: 0,
+            combat_round: None,
+            zone_id: None,
+            encounter_id: None,
+            parent_id: None,
+            summary: huge.clone(),
+            payload: serde_json::json!({}),
+            participants: &[Participant {
+                character_id: kira,
+                role: "actor",
+            }],
+            items: &[],
+        };
+        let emitted = emit(&mut conn, &spec).expect("emit");
+
+        let stored: String = conn
+            .query_row(
+                "SELECT summary FROM events WHERE id = ?1",
+                [emitted.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.len() <= MAX_SUMMARY_BYTES,
+            "stored summary {} bytes should fit under the cap {}",
+            stored.len(),
+            MAX_SUMMARY_BYTES
+        );
+        assert!(
+            stored.ends_with('…'),
+            "truncated summary should end with the ellipsis marker; got tail {:?}",
+            &stored[stored.len().saturating_sub(8)..]
+        );
+    }
+
+    #[test]
+    fn short_summary_passes_through_unchanged() {
+        let mut conn = fresh_conn();
+        let kira = insert_character(&conn, "Kira");
+        let short = "Short summary that should not be touched.";
+        let spec = EventSpec {
+            kind: "test.short",
+            campaign_hour: 0,
+            combat_round: None,
+            zone_id: None,
+            encounter_id: None,
+            parent_id: None,
+            summary: short.to_string(),
+            payload: serde_json::json!({}),
+            participants: &[Participant {
+                character_id: kira,
+                role: "actor",
+            }],
+            items: &[],
+        };
+        let emitted = emit(&mut conn, &spec).expect("emit");
+        let stored: String = conn
+            .query_row(
+                "SELECT summary FROM events WHERE id = ?1",
+                [emitted.event_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, short);
     }
 }

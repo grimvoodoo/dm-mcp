@@ -343,7 +343,10 @@ impl DmMcpHandler {
         &self,
         Parameters(params): Parameters<ApplyConditionParams>,
     ) -> Result<CallToolResult, McpError> {
-        with_db_mut(&self.db, |conn| conditions::apply(conn, params))
+        let content = Arc::clone(&self.content);
+        with_db_mut(&self.db, move |conn| {
+            conditions::apply(conn, &content, params)
+        })
     }
 
     #[tool(

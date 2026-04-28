@@ -101,6 +101,12 @@ pub const VALID_SIDES: &[&str] = &["player_side", "hostile", "neutral", "ally"];
 // ── Implementation ───────────────────────────────────────────────────────────
 
 pub fn create(conn: &mut Connection, p: CreateParams) -> Result<CreateResult> {
+    // XP budget is awarded to player_side participants on encounter.complete; allowing
+    // a negative value would let a malicious or buggy caller deduct XP from players,
+    // which has no game-rules basis. Reject up front rather than letting it propagate.
+    if p.xp_budget < 0 {
+        bail!("encounter xp_budget must be >= 0 (got {})", p.xp_budget);
+    }
     for part in &p.participants {
         if !VALID_SIDES.contains(&part.side.as_str()) {
             bail!(
@@ -637,5 +643,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.xp_awarded_total, 100);
+    }
+
+    #[test]
+    fn create_rejects_negative_xp_budget() {
+        let mut conn = fresh();
+        let err = create(
+            &mut conn,
+            CreateParams {
+                zone_id: None,
+                name: None,
+                goal: "g".into(),
+                estimated_duration_hours: None,
+                xp_budget: -50,
+                participants: vec![],
+            },
+        )
+        .expect_err("negative xp_budget should bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("xp_budget") && msg.contains("-50"),
+            "error should name the field and value: {msg}"
+        );
     }
 }
